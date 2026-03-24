@@ -12,12 +12,67 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
+from pathlib import Path
 from typing import Any, Optional
 
+import filelock
 from megatron.bridge import AutoBridge
 
 from nemo_rl.models.policy import MegatronConfig
+
+
+def _get_megatron_config_lock_dir() -> Path:
+    configured_dir = os.getenv("MEGATRON_CONFIG_LOCK_DIR")
+    if configured_dir:
+        return Path(configured_dir)
+
+    hf_hub_cache = os.getenv("HF_HUB_CACHE")
+    if hf_hub_cache:
+        return Path(hf_hub_cache) / ".megatron_locks"
+
+    hf_home = os.getenv("HF_HOME")
+    if hf_home:
+        return Path(hf_home) / "hub" / ".megatron_locks"
+
+    return Path.home() / ".cache" / "huggingface" / ".megatron_locks"
+
+
+def resolve_hf_model_name_or_path(hf_model_name: str) -> str:
+    """Resolve a remote HF model ID to a shared local snapshot path.
+
+    For local directories, return the original path unchanged. For Hub model IDs,
+    snapshot the repo once behind a shared file lock and return the resolved local
+    snapshot directory. This makes downstream config/tokenizer/model loads stable
+    across distributed workers.
+    """
+    local_path = Path(hf_model_name)
+    if local_path.is_dir():
+        return hf_model_name
+
+    lock_dir = _get_megatron_config_lock_dir()
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MEGATRON_CONFIG_LOCK_DIR", str(lock_dir))
+
+    path_hash = hashlib.md5(hf_model_name.encode()).hexdigest()
+    lock_file = lock_dir / f".hf_snapshot_{path_hash}.lock"
+    local_files_only = os.getenv("HF_HUB_OFFLINE", "0") == "1"
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise RuntimeError(
+            "huggingface_hub is required to resolve remote model IDs to local snapshots."
+        ) from e
+
+    with filelock.FileLock(str(lock_file), timeout=3600):
+        snapshot_path = snapshot_download(
+            repo_id=hf_model_name,
+            local_files_only=local_files_only,
+        )
+
+    return str(snapshot_path)
 
 
 def import_model_from_hf_name(
@@ -33,6 +88,7 @@ def import_model_from_hf_name(
         output_path: Directory to write the Megatron checkpoint (e.g., /tmp/megatron_ckpt).
         megatron_config: Optional megatron config with paralellism settings for distributed megatron model import.
     """
+    hf_model_name = resolve_hf_model_name_or_path(hf_model_name)
     bridge = AutoBridge.from_hf_pretrained(
         hf_model_name, trust_remote_code=True, **config_overrides
     )
@@ -113,6 +169,7 @@ def export_model_from_megatron(
             f"HF checkpoint already exists at {output_path}. Delete it to run or set overwrite=True."
         )
 
+    hf_model_name = resolve_hf_model_name_or_path(hf_model_name)
     try:
         from megatron.bridge.training.model_load_save import (
             temporary_distributed_context,

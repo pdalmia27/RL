@@ -35,6 +35,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
 )
+from nemo_rl.models.generation.vllm.async_state_trace import (
+    ALL_GENERATION_LOGGER_METRICS,
+    is_generation_state_metrics_enabled,
+)
 from nemo_rl.models.generation.vllm.config import VllmConfig
 
 # Global thresholds for top_k and top_p validation.
@@ -42,9 +46,34 @@ from nemo_rl.models.generation.vllm.config import VllmConfig
 # See https://github.com/NVIDIA-NeMo/RL/issues/69 and https://github.com/NVIDIA-NeMo/RL/issues/237 for more details.
 TOP_K_THRESHOLD = 8000  # Allow top_k >= 8000 (effectively no filtering)
 TOP_P_THRESHOLD = 0.99  # Allow top_p >= 0.99 (close to 1.0)
+NRL_NSYS_PROFILE_MAX_ASYNC_COMPLETIONS_ENV = (
+    "NRL_NSYS_PROFILE_MAX_ASYNC_COMPLETIONS"
+)
 
 
 class VllmGeneration(GenerationInterface):
+    @staticmethod
+    def _parse_nsys_async_completion_limit() -> Optional[int]:
+        raw_limit = os.environ.get(
+            NRL_NSYS_PROFILE_MAX_ASYNC_COMPLETIONS_ENV, ""
+        ).strip()
+        if not raw_limit:
+            return None
+
+        try:
+            limit = int(raw_limit)
+        except ValueError as e:
+            raise ValueError(
+                f"{NRL_NSYS_PROFILE_MAX_ASYNC_COMPLETIONS_ENV} must be a positive integer, got {raw_limit!r}"
+            ) from e
+
+        if limit < 1:
+            raise ValueError(
+                f"{NRL_NSYS_PROFILE_MAX_ASYNC_COMPLETIONS_ENV} must be >= 1, got {limit}"
+            )
+
+        return limit
+
     def __init__(
         self,
         cluster: RayVirtualCluster,
@@ -55,6 +84,8 @@ class VllmGeneration(GenerationInterface):
         """Initialize a vLLM policy with distributed workers."""
         # Store config
         self.cfg = config
+        self._nsys_async_completion_limit = self._parse_nsys_async_completion_limit()
+        self._reset_async_profile_completion_gate()
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -222,6 +253,31 @@ class VllmGeneration(GenerationInterface):
 
         # Save the device uuids for the workers
         self.device_uuids = self._report_device_id()
+
+    def _reset_async_profile_completion_gate(self) -> None:
+        self._nsys_async_completion_count = 0
+        self._nsys_async_early_stop_fired = False
+
+    def _maybe_stop_async_profile_after_completion(self) -> None:
+        if self._nsys_async_completion_limit is None:
+            return
+        if self._nsys_async_early_stop_fired:
+            return
+        if not getattr(self, "__NRL_PROFILE_STARTED", False):
+            return
+
+        self._nsys_async_completion_count += 1
+        if self._nsys_async_completion_count < self._nsys_async_completion_limit:
+            return
+
+        print(
+            "[INFO] Stopping GPU profiling early after "
+            f"{self._nsys_async_completion_count} async completions "
+            f"(limit={self._nsys_async_completion_limit})."
+        )
+        self.stop_gpu_profiling()
+        setattr(self, "__NRL_PROFILE_STARTED", False)
+        self._nsys_async_early_stop_fired = True
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
@@ -623,6 +679,7 @@ class VllmGeneration(GenerationInterface):
                 )
 
             if msg_type == "sample":
+                self._maybe_stop_async_profile_after_completion()
                 # Yield individual sample result immediately
                 yield item
             elif msg_type == "error":
@@ -811,6 +868,7 @@ class VllmGeneration(GenerationInterface):
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
+        self._reset_async_profile_completion_gate()
         futures = self.worker_group.run_all_workers_single_data("start_gpu_profiling")
         ray.get(futures)
 
@@ -821,7 +879,7 @@ class VllmGeneration(GenerationInterface):
 
     def get_vllm_logger_metrics(self) -> dict[str, Any]:
         """Collect vLLM logger metrics from vLLM workers (model-owner actors only)."""
-        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+        if not is_generation_state_metrics_enabled(self.cfg["vllm_cfg"]):
             return {}
         if not self.cfg["vllm_cfg"].get("async_engine", False):
             return {}
@@ -839,40 +897,44 @@ class VllmGeneration(GenerationInterface):
 
         results = ray.get(futures)
         vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
-            "inflight_batch_sizes": {},  # dp_idx -> list[int]
-            "num_pending_samples": {},  # dp_idx -> list[int]
-            "kv_cache_usage_perc": {},  # dp_idx -> list[float]
-            "generation_tokens": {},  # dp_idx -> list[int]
+            metric_name: {} for metric_name in ALL_GENERATION_LOGGER_METRICS
         }
 
         for dp_idx, stats in zip(dp_indices, results):
             if not stats:
                 continue
-            inflight_batch_sizes = stats.get("inflight_batch_sizes")
-            if inflight_batch_sizes:
-                vllm_logger_metrics["inflight_batch_sizes"][dp_idx] = (
-                    inflight_batch_sizes
-                )
-            num_pending_samples = stats.get("num_pending_samples")
-            if num_pending_samples:
-                vllm_logger_metrics["num_pending_samples"][dp_idx] = num_pending_samples
-            kv_cache_usage_perc = stats.get("kv_cache_usage_perc")
-            if kv_cache_usage_perc:
-                vllm_logger_metrics["kv_cache_usage_perc"][dp_idx] = kv_cache_usage_perc
-            generation_tokens = stats.get("generation_tokens")
-            if generation_tokens:
-                vllm_logger_metrics["generation_tokens"][dp_idx] = generation_tokens
+            for metric_name in ALL_GENERATION_LOGGER_METRICS:
+                metric_values = stats.get(metric_name)
+                if metric_values:
+                    vllm_logger_metrics[metric_name][dp_idx] = metric_values
 
         return vllm_logger_metrics
 
     def clear_vllm_logger_metrics(self) -> None:
-        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+        if not is_generation_state_metrics_enabled(self.cfg["vllm_cfg"]):
             return
         if not self.cfg["vllm_cfg"].get("async_engine", False):
             return
         futures = self.worker_group.run_all_workers_single_data(
             "clear_vllm_logger_metrics",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        ray.get(futures)
+
+    def set_async_state_trace_context(
+        self, step: int, generation_pass_idx: int, trace_dir: str
+    ) -> None:
+        if not is_generation_state_metrics_enabled(self.cfg["vllm_cfg"]):
+            return
+        if not self.cfg["vllm_cfg"].get("async_engine", False):
+            return
+
+        futures = self.worker_group.run_all_workers_single_data(
+            "set_async_state_trace_context",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            step=step,
+            generation_pass_idx=generation_pass_idx,
+            trace_dir=trace_dir,
         )
         ray.get(futures)
 

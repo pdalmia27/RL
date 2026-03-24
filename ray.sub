@@ -93,6 +93,13 @@ MAX_WORKER_PORT=${MAX_WORKER_PORT:-54513}
 # Number seconds to sync logs from /tmp/ray/session_*/logs to $LOG_DIR/ray/
 RAY_LOG_SYNC_FREQUENCY=${RAY_LOG_SYNC_FREQUENCY:-}
 ########################################################
+# Optional PATH prefix injected inside the container before Ray starts.
+# This is useful when a newer nsys exists in /usr/local/bin but the default
+# container PATH would otherwise pick /usr/local/cuda/bin/nsys first.
+CONTAINER_PATH_PREFIX=${CONTAINER_PATH_PREFIX:-}
+# Optional absolute nsys binary path forced into Ray's nsight launcher.
+RAY_NSYS_BINARY=${RAY_NSYS_BINARY:-}
+########################################################
 
 # Unset UV_CACHE_DIR to avoid local cache directory interferring with the container cache
 unset UV_CACHE_DIR
@@ -110,6 +117,7 @@ fi
 BASE_LOG_DIR=${BASE_LOG_DIR:-$SLURM_SUBMIT_DIR}
 LOG_DIR="$BASE_LOG_DIR/$SLURM_JOB_ID-logs"
 mkdir -p $LOG_DIR
+REPO_ROOT=$(pwd -P)
 
 # Number of GPUs per worker node
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
@@ -212,6 +220,12 @@ head_cmd=$(cat <<EOF
 # Touch a file to indicate that the head node has started
 # Overlapping srun commands will check this file to determine if we can overlap a container command
 touch $LOG_DIR/STARTED_RAY_HEAD
+if [[ -n "$CONTAINER_PATH_PREFIX" ]]; then
+  export PATH="$CONTAINER_PATH_PREFIX:\$PATH"
+fi
+if [[ -n "$RAY_NSYS_BINARY" ]]; then
+  export RAY_NSYS_BINARY="$RAY_NSYS_BINARY"
+fi
 env
 
 exit-dramatically() {
@@ -268,7 +282,7 @@ log-sync-sidecar() {
 log-sync-sidecar &
 
 # Patch nsight.py before starting Ray head
-sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
+python3 "$REPO_ROOT/tools/patch_ray_nsight.py"
 
 cat <<EOFINNER | tee /launch-head.sh
 ray start --head \
@@ -317,6 +331,12 @@ for ((i = 1; i < SLURM_JOB_NUM_NODES; i++)); do
   node_i=${nodes_array[$i]}
     
   worker_cmd=$(cat <<EOF
+if [[ -n "$CONTAINER_PATH_PREFIX" ]]; then
+  export PATH="$CONTAINER_PATH_PREFIX:\$PATH"
+fi
+if [[ -n "$RAY_NSYS_BINARY" ]]; then
+  export RAY_NSYS_BINARY="$RAY_NSYS_BINARY"
+fi
 env
 
 exit-dramatically() {
@@ -372,7 +392,7 @@ log-sync-sidecar() {
 log-sync-sidecar &
 
 # Patch nsight.py before starting Ray worker
-sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/context.py_executable = " ".join(self.nsight_cmd) + f" {context.py_executable}"/g' /opt/nemo_rl_venv/lib64/python*/site-packages/ray/_private/runtime_env/nsight.py
+python3 "$REPO_ROOT/tools/patch_ray_nsight.py"
 
 cat <<EOFINNER | tee /launch-worker.sh
 ray start --address "$ip_head" \
@@ -448,7 +468,14 @@ echo "All workers connected!"
 # This driver process is responsible for launching a job on the Ray cluster
 CONTAINER_CWD=$(scontrol show job $SLURM_JOB_ID | grep -oP 'WorkDir=\K[^ ]+' | head -1)
 if [[ -n "$COMMAND" ]]; then
-  srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$COMMAND"
+  DRIVER_COMMAND="$COMMAND"
+  if [[ -n "$CONTAINER_PATH_PREFIX" ]]; then
+    DRIVER_COMMAND='export PATH="'"$CONTAINER_PATH_PREFIX"':$PATH"; '"$DRIVER_COMMAND"
+  fi
+  if [[ -n "$RAY_NSYS_BINARY" ]]; then
+    DRIVER_COMMAND='export RAY_NSYS_BINARY="'"$RAY_NSYS_BINARY"'"; '"$DRIVER_COMMAND"
+  fi
+  srun --no-container-mount-home --overlap --container-name=ray-head --container-workdir=$CONTAINER_CWD --nodes=1 --ntasks=1 -w "$head_node" -o $LOG_DIR/ray-driver.log bash -c "$DRIVER_COMMAND"
 else
   echo "[INFO]: Ray Cluster is idled, run this on the slurm head node to get a shell to the head node:"
   cat <<EOF >$SLURM_SUBMIT_DIR/${SLURM_JOB_ID}-attach.sh

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, NotRequired, TypedDict, Union
+from typing import Any, Literal, NotRequired, TypedDict, Union
 
 import ray
 import torch
@@ -115,6 +115,17 @@ class ColocationConfig(TypedDict):
     resources: OptionalResourcesConfig
 
 
+class TruncLognormalFromMeanOutputLengthGeneratorConfig(TypedDict):
+    type: Literal["trunc_lognormal_from_mean"]
+    mean_osl: int
+    max_osl: int
+    p_max: NotRequired[float]
+    seed: NotRequired[int]
+
+
+OutputLengthGeneratorConfig = TruncLognormalFromMeanOutputLengthGeneratorConfig
+
+
 class GenerationConfig(TypedDict):
     """Configuration for generation."""
 
@@ -126,9 +137,14 @@ class GenerationConfig(TypedDict):
     model_name: NotRequired[str]  # Not Required b/c GRPO writes this
     stop_token_ids: list[int] | None
     stop_strings: list[str] | None
+    ignore_eos: NotRequired[bool]
+    output_len_or_output_len_generator: NotRequired[
+        OutputLengthGeneratorConfig | int | None
+    ]
     colocated: NotRequired[ColocationConfig]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
+    _eos_token_id: NotRequired[int | None]
 
 
 class GenerationDatumSpec(TypedDict):
@@ -209,6 +225,10 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
+    sampled_output_lengths: NotRequired[torch.Tensor]
+    output_length_clipped_by_context: NotRequired[torch.Tensor]
+    output_length_clipped_by_max_new_tokens: NotRequired[torch.Tensor]
+    zero_token_generations_due_to_context: NotRequired[torch.Tensor]
     __extra__: Any
 
 

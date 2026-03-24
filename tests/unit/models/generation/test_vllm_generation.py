@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
 import os
 from copy import deepcopy
@@ -32,7 +33,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorker,
     _replace_prefix_tokens,
 )
 from nemo_rl.models.policy import PolicyConfig
@@ -2528,3 +2531,167 @@ def test_vllm_megatron_weight_update_with_packing(cluster, test_input_data):
             megatron_policy.shutdown()
         if vllm_generation:
             vllm_generation.shutdown()
+
+
+def test_parse_nsys_async_completion_limit(monkeypatch):
+    monkeypatch.delenv("NRL_NSYS_PROFILE_MAX_ASYNC_COMPLETIONS", raising=False)
+    assert VllmGeneration._parse_nsys_async_completion_limit() is None
+
+    monkeypatch.setenv("NRL_NSYS_PROFILE_MAX_ASYNC_COMPLETIONS", "4")
+    assert VllmGeneration._parse_nsys_async_completion_limit() == 4
+
+
+@pytest.mark.parametrize("raw_value", ["0", "-1", "abc"])
+def test_parse_nsys_async_completion_limit_rejects_invalid_values(
+    monkeypatch, raw_value
+):
+    monkeypatch.setenv("NRL_NSYS_PROFILE_MAX_ASYNC_COMPLETIONS", raw_value)
+
+    with pytest.raises(ValueError):
+        VllmGeneration._parse_nsys_async_completion_limit()
+
+
+def test_async_profile_completion_gate_disabled_without_limit():
+    vllm_generation = VllmGeneration.__new__(VllmGeneration)
+    vllm_generation._nsys_async_completion_limit = None
+    vllm_generation._reset_async_profile_completion_gate()
+
+    stop_calls = []
+    vllm_generation.stop_gpu_profiling = lambda: stop_calls.append("stop")
+    setattr(vllm_generation, "__NRL_PROFILE_STARTED", True)
+
+    vllm_generation._maybe_stop_async_profile_after_completion()
+
+    assert vllm_generation._nsys_async_completion_count == 0
+    assert stop_calls == []
+    assert getattr(vllm_generation, "__NRL_PROFILE_STARTED", False) is True
+
+
+def test_async_profile_completion_gate_stops_once():
+    vllm_generation = VllmGeneration.__new__(VllmGeneration)
+    vllm_generation._nsys_async_completion_limit = 2
+    vllm_generation._reset_async_profile_completion_gate()
+
+    stop_calls = []
+    vllm_generation.stop_gpu_profiling = lambda: stop_calls.append("stop")
+    setattr(vllm_generation, "__NRL_PROFILE_STARTED", True)
+
+    vllm_generation._maybe_stop_async_profile_after_completion()
+    assert vllm_generation._nsys_async_completion_count == 1
+    assert stop_calls == []
+    assert getattr(vllm_generation, "__NRL_PROFILE_STARTED", False) is True
+
+    vllm_generation._maybe_stop_async_profile_after_completion()
+    assert vllm_generation._nsys_async_completion_count == 2
+    assert stop_calls == ["stop"]
+    assert getattr(vllm_generation, "__NRL_PROFILE_STARTED", False) is False
+    assert vllm_generation._nsys_async_early_stop_fired is True
+
+    vllm_generation._maybe_stop_async_profile_after_completion()
+    assert vllm_generation._nsys_async_completion_count == 2
+    assert stop_calls == ["stop"]
+
+
+def test_start_gpu_profiling_resets_async_completion_gate(monkeypatch):
+    class DummyWorkerGroup:
+        def __init__(self):
+            self.calls = []
+
+        def run_all_workers_single_data(self, method_name):
+            self.calls.append(method_name)
+            return ["future"]
+
+    ray_get_calls = []
+    monkeypatch.setattr(ray, "get", lambda futures: ray_get_calls.append(futures))
+
+    vllm_generation = VllmGeneration.__new__(VllmGeneration)
+    vllm_generation.worker_group = DummyWorkerGroup()
+    vllm_generation._nsys_async_completion_limit = 4
+    vllm_generation._nsys_async_completion_count = 99
+    vllm_generation._nsys_async_early_stop_fired = True
+
+    vllm_generation.start_gpu_profiling()
+
+    assert vllm_generation._nsys_async_completion_count == 0
+    assert vllm_generation._nsys_async_early_stop_fired is False
+    assert vllm_generation.worker_group.calls == ["start_gpu_profiling"]
+    assert ray_get_calls == [["future"]]
+
+
+def test_base_vllm_generation_worker_profile_noops_without_llm(monkeypatch):
+    worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
+    worker.llm = None
+
+    monkeypatch.setattr(
+        torch.cuda.profiler,
+        "start",
+        lambda: pytest.fail("non-model-owner worker should not profile locally"),
+    )
+    monkeypatch.setattr(
+        torch.cuda.profiler,
+        "stop",
+        lambda: pytest.fail("non-model-owner worker should not profile locally"),
+    )
+
+    worker.start_gpu_profiling()
+    worker.stop_gpu_profiling()
+
+
+def test_base_vllm_generation_worker_profiles_internal_workers_when_llm_present():
+    class DummyLLM:
+        def __init__(self):
+            self.calls = []
+
+        def collective_rpc(self, method_name, args):
+            self.calls.append((method_name, args))
+
+    worker = BaseVllmGenerationWorker.__new__(BaseVllmGenerationWorker)
+    worker.llm = DummyLLM()
+
+    worker.start_gpu_profiling()
+    worker.stop_gpu_profiling()
+
+    assert worker.llm.calls == [
+        ("start_gpu_profiling", tuple()),
+        ("stop_gpu_profiling", tuple()),
+    ]
+
+
+def test_vllm_async_generation_worker_profile_noops_without_llm(monkeypatch):
+    worker = VllmAsyncGenerationWorker.__new__(VllmAsyncGenerationWorker)
+    worker.llm = None
+
+    monkeypatch.setattr(
+        torch.cuda.profiler,
+        "start",
+        lambda: pytest.fail("non-model-owner worker should not profile locally"),
+    )
+    monkeypatch.setattr(
+        torch.cuda.profiler,
+        "stop",
+        lambda: pytest.fail("non-model-owner worker should not profile locally"),
+    )
+
+    asyncio.run(worker.start_gpu_profiling())
+    asyncio.run(worker.stop_gpu_profiling())
+
+
+def test_vllm_async_generation_worker_profiles_internal_workers_when_llm_present():
+    class DummyAsyncLLM:
+        def __init__(self):
+            self.calls = []
+
+        async def collective_rpc(self, method_name, args):
+            self.calls.append((method_name, args))
+            return None
+
+    worker = VllmAsyncGenerationWorker.__new__(VllmAsyncGenerationWorker)
+    worker.llm = DummyAsyncLLM()
+
+    asyncio.run(worker.start_gpu_profiling())
+    asyncio.run(worker.stop_gpu_profiling())
+
+    assert worker.llm.calls == [
+        ("start_gpu_profiling", tuple()),
+        ("stop_gpu_profiling", tuple()),
+    ]

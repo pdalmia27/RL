@@ -14,17 +14,92 @@
 
 import fnmatch
 import logging
+import os
 from copy import deepcopy
 from typing import Any
 
 from nemo_rl.utils.nsys import NRL_NSYS_PROFILE_STEP_RANGE, NRL_NSYS_WORKER_PATTERNS
 
+NRL_NSYS_VLLM_WORKER_INDICES_ENV = "NRL_NSYS_VLLM_WORKER_INDICES"
+NRL_RAY_WORKER_IDX_ENV = "NRL_RAY_WORKER_IDX"
 
-def get_nsight_config_if_pattern_matches(worker_name: str) -> dict[str, Any]:
+_VLLM_NSYS_WORKER_NAMES = frozenset(
+    {"vllm_generation_worker", "vllm_async_generation_worker"}
+)
+
+
+def _get_profiled_vllm_worker_indices() -> set[int] | None:
+    worker_indices_env = os.environ.get(NRL_NSYS_VLLM_WORKER_INDICES_ENV, "").strip()
+    if not worker_indices_env:
+        return None
+
+    worker_indices: set[int] = set()
+    for worker_index_str in worker_indices_env.split(","):
+        worker_index_str = worker_index_str.strip()
+        if not worker_index_str:
+            continue
+        try:
+            worker_index = int(worker_index_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"{NRL_NSYS_VLLM_WORKER_INDICES_ENV} must be a comma-separated list of integers, "
+                f"got {worker_indices_env!r}"
+            ) from exc
+
+        if worker_index < 0:
+            raise ValueError(
+                f"{NRL_NSYS_VLLM_WORKER_INDICES_ENV} only supports non-negative worker indices, "
+                f"got {worker_index}"
+            )
+        worker_indices.add(worker_index)
+    return worker_indices
+
+
+def _resolve_worker_idx(worker_idx: int | None) -> int | None:
+    if worker_idx is not None:
+        return worker_idx
+
+    worker_idx_env = os.environ.get(NRL_RAY_WORKER_IDX_ENV, "").strip()
+    if not worker_idx_env:
+        return None
+
+    try:
+        resolved_worker_idx = int(worker_idx_env)
+    except ValueError as exc:
+        raise ValueError(
+            f"{NRL_RAY_WORKER_IDX_ENV} must be an integer when set, got {worker_idx_env!r}"
+        ) from exc
+
+    if resolved_worker_idx < 0:
+        raise ValueError(
+            f"{NRL_RAY_WORKER_IDX_ENV} only supports non-negative worker indices, got {resolved_worker_idx}"
+        )
+
+    return resolved_worker_idx
+
+
+def is_vllm_worker_nsight_index_filter_enabled() -> bool:
+    return _get_profiled_vllm_worker_indices() is not None
+
+
+def get_nsight_worker_name_for_actor_class(ray_actor_class_fqn: str) -> str | None:
+    class_name = ray_actor_class_fqn.rsplit(".", 1)[-1]
+    if class_name == "VllmGenerationWorker":
+        return "vllm_generation_worker"
+    if class_name == "VllmAsyncGenerationWorker":
+        return "vllm_async_generation_worker"
+    return None
+
+
+def get_nsight_config_if_pattern_matches(
+    worker_name: str, worker_idx: int | None = None
+) -> dict[str, Any]:
     """Check if worker name matches patterns in NRL_NSYS_WORKER_PATTERNS and return nsight config.
 
     Args:
         worker_name: Name of the worker to check against patterns
+        worker_idx: Optional stable worker index used to restrict profiling to a
+            subset of vLLM workers when NRL_NSYS_VLLM_WORKER_INDICES is set.
 
     Returns:
         Dictionary containing {"nsight": config} if pattern matches, empty dict otherwise
@@ -41,17 +116,38 @@ def get_nsight_config_if_pattern_matches(worker_name: str) -> dict[str, Any]:
     patterns = [
         pattern.strip() for pattern in patterns_env.split(",") if pattern.strip()
     ]
+    profiled_vllm_worker_indices = _get_profiled_vllm_worker_indices()
+    resolved_worker_idx = _resolve_worker_idx(worker_idx)
 
     # Check if worker name matches any pattern
     for pattern in patterns:
         if fnmatch.fnmatch(worker_name, pattern):
-            logging.info(
-                f"Nsight profiling enabled for worker '{worker_name}' (matched pattern '{pattern}')"
-            )
+            if (
+                profiled_vllm_worker_indices is not None
+                and worker_name in _VLLM_NSYS_WORKER_NAMES
+            ):
+                if resolved_worker_idx is None:
+                    return {}
+                if resolved_worker_idx not in profiled_vllm_worker_indices:
+                    return {}
+
+                output_name = (
+                    f"'{worker_name}_{NRL_NSYS_PROFILE_STEP_RANGE}_w{resolved_worker_idx}_%p'"
+                )
+                logging.info(
+                    f"Nsight profiling enabled for worker '{worker_name}' "
+                    f"(worker_idx={resolved_worker_idx}, matched pattern '{pattern}')"
+                )
+            else:
+                output_name = f"'{worker_name}_{NRL_NSYS_PROFILE_STEP_RANGE}_%p'"
+                logging.info(
+                    f"Nsight profiling enabled for worker '{worker_name}' (matched pattern '{pattern}')"
+                )
+
             return {
                 "nsight": {
                     "t": "cuda,cudnn,cublas,nvtx",
-                    "o": f"'{worker_name}_{NRL_NSYS_PROFILE_STEP_RANGE}_%p'",
+                    "o": output_name,
                     "stop-on-exit": "true",
                     # Capture range is required to control the scope of the profile
                     # Profile will only start/stop when torch.cuda.profiler.start()/stop() is called

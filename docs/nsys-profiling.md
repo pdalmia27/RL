@@ -28,6 +28,23 @@ format is colon separated integers representing `start:stop`, where `start` is i
 export NRL_NSYS_PROFILE_STEP_RANGE=3:5
 ```
 
+For async vLLM generation workers, you can also stop profiling early within the profiled step by setting
+`NRL_NSYS_PROFILE_MAX_ASYNC_COMPLETIONS` to a positive integer. When set, NeMo RL will stop profiling after the first
+`N` completed async generation results observed during the active profiled step. If unset, the profiler continues until
+the configured step range ends.
+
+```bash
+export NRL_NSYS_PROFILE_MAX_ASYNC_COMPLETIONS=4
+```
+
+If you want to profile only a subset of vLLM workers, set `NRL_NSYS_VLLM_WORKER_INDICES` to a comma-separated list of
+zero-based worker indices. This only affects `vllm_generation_worker` and `vllm_async_generation_worker`. When set,
+unselected vLLM workers will skip nsight entirely.
+
+```bash
+export NRL_NSYS_VLLM_WORKER_INDICES=0
+```
+
 ### Pattern Format
 
 - Use shell-style wildcards (`*`, `?`, `[seq]`, `[!seq]`)
@@ -41,6 +58,7 @@ export NRL_NSYS_PROFILE_STEP_RANGE=3:5
 The supported worker types are:
 - **DTensorPolicyWorker**: Pattern matched against `"dtensor_policy_worker"`
 - **VllmGenerationWorker**: Pattern matched against `"vllm_generation_worker"`
+- **VllmAsyncGenerationWorker**: Pattern matched against `"vllm_async_generation_worker"`
 
 ## Example Usage
 
@@ -53,6 +71,24 @@ NRL_NSYS_PROFILE_STEP_RANGE=2:3 NRL_NSYS_WORKER_PATTERNS="*policy*" uv run examp
 
 ```bash
 NRL_NSYS_PROFILE_STEP_RANGE=1:2 NRL_NSYS_WORKER_PATTERNS="*policy*,*vllm*" uv run examples/run_grpo_math.py grpo.max_num_steps=5
+```
+
+### Profile Only the First Few Async vLLM Completions
+
+```bash
+NRL_NSYS_PROFILE_STEP_RANGE=2:3 \
+NRL_NSYS_PROFILE_MAX_ASYNC_COMPLETIONS=4 \
+NRL_NSYS_WORKER_PATTERNS="vllm_async_generation_worker" \
+uv run examples/run_grpo_math.py grpo.max_num_steps=5
+```
+
+### Profile Only One Async vLLM Worker
+
+```bash
+NRL_NSYS_PROFILE_STEP_RANGE=2:3 \
+NRL_NSYS_WORKER_PATTERNS="vllm_async_generation_worker" \
+NRL_NSYS_VLLM_WORKER_INDICES=0 \
+uv run examples/run_grpo_math.py grpo.max_num_steps=5
 ```
 
 ### Profile Workers with Exact Names
@@ -84,6 +120,8 @@ When profiling is enabled, it generates the following logs and files:
    ```
    dtensor_policy_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
    vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep
+   vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_w<WORKER_IDX>_<PID>.nsys-rep
+   vllm_async_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_w<WORKER_IDX>_<PID>.nsys-rep
    worker_process_<PID>.nsys-rep
    ```
 If you are not using model parallelism in Vllm, you should directly refer to `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` for nsight reports; If you are using model parallelism, the `vllm_generation_worker_<NRL_NSYS_PROFILE_STEP_RANGE>_<PID>.nsys-rep` will be empty, and the `worker_process_<PID>.nsys-rep` are nsight profiles from vllm's ray distributed executors (refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 for more information).

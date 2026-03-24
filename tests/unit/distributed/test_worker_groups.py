@@ -1081,6 +1081,95 @@ def test_get_nsight_config_if_pattern_matches():
         assert result == {}
 
 
+def test_get_nsight_config_if_pattern_matches_vllm_worker_index_filter():
+    """Test restricting nsight to selected vLLM worker indices."""
+    from unittest.mock import patch
+
+    from nemo_rl.distributed.worker_group_utils import (
+        NRL_NSYS_VLLM_WORKER_INDICES_ENV,
+        NRL_RAY_WORKER_IDX_ENV,
+        get_nsight_config_if_pattern_matches,
+    )
+
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*vllm*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "2:3"
+        ),
+        patch.dict(os.environ, {NRL_NSYS_VLLM_WORKER_INDICES_ENV: "1,3"}),
+    ):
+        assert (
+            get_nsight_config_if_pattern_matches(
+                "vllm_async_generation_worker", worker_idx=0
+            )
+            == {}
+        )
+
+        result = get_nsight_config_if_pattern_matches(
+            "vllm_async_generation_worker", worker_idx=1
+        )
+        assert "nsight" in result
+        assert (
+            result["nsight"]["o"]
+            == "'vllm_async_generation_worker_2:3_w1_%p'"
+        )
+
+        # When worker_idx is omitted inside the worker process, the helper falls back to env.
+        with patch.dict(os.environ, {NRL_RAY_WORKER_IDX_ENV: "3"}, clear=False):
+            env_result = get_nsight_config_if_pattern_matches(
+                "vllm_generation_worker"
+            )
+            assert "nsight" in env_result
+            assert env_result["nsight"]["o"] == "'vllm_generation_worker_2:3_w3_%p'"
+
+
+def test_get_nsight_config_if_pattern_matches_non_vllm_worker_ignores_index_filter():
+    """Test that the vLLM worker index filter does not affect other worker types."""
+    from unittest.mock import patch
+
+    from nemo_rl.distributed.worker_group_utils import (
+        NRL_NSYS_VLLM_WORKER_INDICES_ENV,
+        get_nsight_config_if_pattern_matches,
+    )
+
+    with (
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_WORKER_PATTERNS",
+            "*policy*",
+        ),
+        patch(
+            "nemo_rl.distributed.worker_group_utils.NRL_NSYS_PROFILE_STEP_RANGE", "4:6"
+        ),
+        patch.dict(os.environ, {NRL_NSYS_VLLM_WORKER_INDICES_ENV: "0"}),
+    ):
+        result = get_nsight_config_if_pattern_matches("dtensor_policy_worker")
+        assert "nsight" in result
+        assert result["nsight"]["o"] == "'dtensor_policy_worker_4:6_%p'"
+
+
+def test_get_nsight_worker_name_for_actor_class():
+    from nemo_rl.distributed.worker_group_utils import (
+        get_nsight_worker_name_for_actor_class,
+    )
+
+    assert (
+        get_nsight_worker_name_for_actor_class(
+            "foo.bar.vllm_worker.VllmAsyncGenerationWorker"
+        )
+        == "vllm_async_generation_worker"
+    )
+    assert (
+        get_nsight_worker_name_for_actor_class(
+            "foo.bar.vllm_worker.VllmGenerationWorker"
+        )
+        == "vllm_generation_worker"
+    )
+    assert get_nsight_worker_name_for_actor_class("foo.bar.OtherWorker") is None
+
+
 def test_get_nsight_config_output_format():
     """Test that the nsight config output can be directly unpacked into runtime_env."""
     from unittest.mock import patch

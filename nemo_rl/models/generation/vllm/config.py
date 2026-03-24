@@ -26,6 +26,11 @@ class VllmSpecificArgs(TypedDict):
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used
     skip_tokenizer_init: bool
     async_engine: bool
+    enable_vllm_metrics_logger: NotRequired[bool]
+    vllm_metrics_logger_interval: NotRequired[float]
+    enable_async_state_trace: NotRequired[bool]
+    async_state_trace_interval: NotRequired[float]
+    async_state_trace_dir: NotRequired[str]
     load_format: NotRequired[str]
     precision: NotRequired[str]
     kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]

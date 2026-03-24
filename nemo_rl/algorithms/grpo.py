@@ -61,6 +61,9 @@ from nemo_rl.experience.rollouts import (
     run_multi_turn_rollout,
 )
 from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.vllm.async_state_trace import (
+    is_generation_state_metrics_enabled,
+)
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -1150,6 +1153,17 @@ def grpo_train(
                 with timer.time("generation"):
                     # Clear vLLM logger metrics for each generation step
                     if policy_generation is not None and hasattr(
+                        policy_generation, "set_async_state_trace_context"
+                    ):
+                        policy_generation.set_async_state_trace_context(
+                            step=current_step + 1,
+                            generation_pass_idx=dynamic_sampling_num_gen_batches,
+                            trace_dir=os.path.join(
+                                master_config["logger"]["log_dir"],
+                                "async_state_trace",
+                            ),
+                        )
+                    if policy_generation is not None and hasattr(
                         policy_generation, "clear_vllm_logger_metrics"
                     ):
                         policy_generation.clear_vllm_logger_metrics()
@@ -1579,15 +1593,18 @@ def grpo_train(
                     total_steps + 1,
                     name="train/token_mult_prob_error_plot_sample",
                 )
-            if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
-                "enable_vllm_metrics_logger", False
+            if is_generation_state_metrics_enabled(
+                master_config["policy"]["generation"].get("vllm_cfg", {})
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
                 log_generation_metrics_to_wandb(
                     vllm_logger_metrics,
                     total_steps + 1,
-                    master_config["policy"]["generation"]["vllm_cfg"][
-                        "vllm_metrics_logger_interval"
-                    ],
+                    master_config["policy"]["generation"]["vllm_cfg"].get(
+                        "async_state_trace_interval",
+                        master_config["policy"]["generation"]["vllm_cfg"].get(
+                            "vllm_metrics_logger_interval"
+                        ),
+                    ),
                     logger,
                 )
 
@@ -1620,6 +1637,18 @@ def grpo_train(
                 f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}",
                 flush=True,
             )
+            if "sampled_output_length/mean" in rollout_metrics:
+                print(
+                    f"  • Mean Sampled Output Length: {rollout_metrics['sampled_output_length/mean']:.4f}",
+                    flush=True,
+                )
+                print(
+                    "  • Synthetic Output Length Clips: "
+                    f"context={int(rollout_metrics.get('num_output_length_clipped_by_context', 0))} "
+                    f"max_new_tokens={int(rollout_metrics.get('num_output_length_clipped_by_max_new_tokens', 0))} "
+                    f"zero_due_to_context={int(rollout_metrics.get('num_zero_token_generations_due_to_context', 0))}",
+                    flush=True,
+                )
 
             print("\n⏱️  Timing:", flush=True)
             # Display total time first, separately
@@ -2054,6 +2083,17 @@ def async_grpo_train(
 
     # Clear vLLM logger metrics after at start of training
     if policy_generation is not None and hasattr(
+        policy_generation, "set_async_state_trace_context"
+    ):
+        policy_generation.set_async_state_trace_context(
+            step=step + 1,
+            generation_pass_idx=weight_version + 1,
+            trace_dir=os.path.join(
+                master_config["logger"]["log_dir"],
+                "async_state_trace",
+            ),
+        )
+    if policy_generation is not None and hasattr(
         policy_generation, "clear_vllm_logger_metrics"
     ):
         policy_generation.clear_vllm_logger_metrics()
@@ -2329,6 +2369,17 @@ def async_grpo_train(
 
                 # Clear vLLM logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None and hasattr(
+                    policy_generation, "set_async_state_trace_context"
+                ):
+                    policy_generation.set_async_state_trace_context(
+                        step=step + 2,
+                        generation_pass_idx=weight_version + 1,
+                        trace_dir=os.path.join(
+                            master_config["logger"]["log_dir"],
+                            "async_state_trace",
+                        ),
+                    )
+                if policy_generation is not None and hasattr(
                     policy_generation, "clear_vllm_logger_metrics"
                 ):
                     policy_generation.clear_vllm_logger_metrics()
@@ -2528,15 +2579,18 @@ def async_grpo_train(
             metrics["buffer_size"] = buffer_size_current
             metrics["avg_trajectory_age"] = avg_trajectory_age
 
-            if master_config["policy"]["generation"].get("vllm_cfg", {}).get(
-                "enable_vllm_metrics_logger", False
+            if is_generation_state_metrics_enabled(
+                master_config["policy"]["generation"].get("vllm_cfg", {})
             ) and master_config.get("logger", {}).get("wandb_enabled", False):
                 log_generation_metrics_to_wandb(
                     vllm_logger_metrics,
                     step + 1,
-                    master_config["policy"]["generation"]["vllm_cfg"][
-                        "vllm_metrics_logger_interval"
-                    ],
+                    master_config["policy"]["generation"]["vllm_cfg"].get(
+                        "async_state_trace_interval",
+                        master_config["policy"]["generation"]["vllm_cfg"].get(
+                            "vllm_metrics_logger_interval"
+                        ),
+                    ),
                     logger,
                 )
 

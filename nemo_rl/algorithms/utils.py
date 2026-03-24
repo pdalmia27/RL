@@ -27,6 +27,11 @@ from transformers import (
 )
 
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.models.generation.vllm.async_state_trace import (
+    filter_generation_logger_metrics_for_wandb,
+    get_generation_state_metrics_interval,
+    is_generation_state_metrics_enabled,
+)
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.utils.logger import Logger
 
@@ -515,12 +520,31 @@ def print_performance_metrics(
             else:
                 print(f"    - Generation Worker {dp_idx:3.0f}: {''.join(timeline)}")
 
-    is_vllm_metrics_logger_enabled = master_config["policy"]["generation"].get(
-        "vllm_cfg", {}
-    ).get("enable_vllm_metrics_logger", False) and master_config["policy"][
-        "generation"
-    ].get("vllm_cfg", {}).get("async_engine", False)
-    if is_vllm_metrics_logger_enabled:
+    def flatten_metric_values(
+        metric_dict: dict[int, list[int | float]]
+    ) -> list[float]:
+        flattened: list[float] = []
+        for metric_values in metric_dict.values():
+            flattened.extend(float(v) for v in metric_values)
+        return flattened
+
+    def summarize_metric(
+        metric_dict: dict[int, list[int | float]],
+    ) -> tuple[float, float, float] | None:
+        flattened = flatten_metric_values(metric_dict)
+        if not flattened:
+            return None
+        metric_values_np = np.asarray(flattened, dtype=np.float64)
+        return (
+            float(np.mean(metric_values_np)),
+            float(np.percentile(metric_values_np, 95.0)),
+            float(np.max(metric_values_np)),
+        )
+
+    is_generation_state_metrics_enabled_flag = is_generation_state_metrics_enabled(
+        master_config["policy"]["generation"].get("vllm_cfg", {})
+    )
+    if is_generation_state_metrics_enabled_flag:
         vllm_logger_metrics = metrics["vllm_logger_metrics"]
         # vllm_logger_me    trics: dict[str (metric_name), dict[int (dp_idx), list[int] (metric_values)]]
         # metric_name: "inflight_batch_sizes" or "num_pending_samples"
@@ -538,9 +562,9 @@ def print_performance_metrics(
             "num_pending_samples must be a dictionary"
         )
 
-        vllm_metrics_logger_interval = master_config["policy"]["generation"][
-            "vllm_cfg"
-        ]["vllm_metrics_logger_interval"]
+        vllm_metrics_logger_interval = get_generation_state_metrics_interval(
+            master_config["policy"]["generation"]["vllm_cfg"]
+        )
         print("  • vLLM Logger Metrics:")
         # Visualize the inflight batch sizes timeline
         if len(vllm_logger_metrics["inflight_batch_sizes"].values()) > 0:
@@ -561,6 +585,30 @@ def print_performance_metrics(
                     "Num Pending Samples",
                     None,
                 )
+
+        state_trace_summaries = (
+            ("decode_batch_sizes", "decode_batch_size"),
+            ("context_batch_sizes", "context_batch_size"),
+            ("pending_requests", "pending_requests"),
+            ("avg_kv_slens", "avg_kv_slen"),
+            ("new_prefills_per_tick", "new_prefills_per_tick"),
+            ("decode_tokens_per_tick", "decode_tokens_per_tick"),
+        )
+        printed_state_trace_header = False
+        for metric_key, metric_name in state_trace_summaries:
+            summary = summarize_metric(vllm_logger_metrics.get(metric_key, {}))
+            if summary is None:
+                continue
+            mean_value, p95_value, max_value = summary
+            if not printed_state_trace_header:
+                print("  • Async State Trace:")
+                printed_state_trace_header = True
+            print(
+                f"    - {metric_name}: mean={mean_value:.2f} p95={p95_value:.2f} max={max_value:.2f}"
+            )
+            performance_metrics[f"state_trace/{metric_name}/mean"] = mean_value
+            performance_metrics[f"state_trace/{metric_name}/p95"] = p95_value
+            performance_metrics[f"state_trace/{metric_name}/max"] = max_value
 
     # =====================================================
     # Throughputs
@@ -761,6 +809,9 @@ def log_generation_metrics_to_wandb(
         timeline_interval: Interval between timeline points (in seconds)
         logger: Logger instance
     """
+    generation_logger_metrics = filter_generation_logger_metrics_for_wandb(
+        generation_logger_metrics
+    )
     for generation_metric in generation_logger_metrics.keys():
         logger.log_plot_per_worker_timeline_metrics(
             generation_logger_metrics[generation_metric],

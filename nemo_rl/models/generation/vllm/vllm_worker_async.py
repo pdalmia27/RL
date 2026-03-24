@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import asyncio
-import copy
 import gc
+import os
 import threading
 import time
 import uuid
@@ -27,11 +27,19 @@ from fastapi import FastAPI
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import _get_free_port_local, _get_node_ip_local
-from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.distributed.worker_group_utils import (
+    NRL_RAY_WORKER_IDX_ENV,
+    get_nsight_config_if_pattern_matches,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
     verify_right_padding,
+)
+from nemo_rl.models.generation.vllm.async_state_trace import (
+    AsyncStateTraceRecorder,
+    get_generation_state_metrics_interval,
+    is_generation_state_metrics_enabled,
 )
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
@@ -160,9 +168,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
+        enable_generation_state_metrics = is_generation_state_metrics_enabled(
+            self.cfg["vllm_cfg"]
+        )
         self.stat_loggers = (
             [PrometheusStatLogger]
-            if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
+            if enable_generation_state_metrics
             else []
         )
         self.llm = AsyncLLM.from_engine_args(
@@ -178,7 +189,15 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
         self._vllm_metrics_lock = threading.Lock()
-        if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+        self._async_state_trace_recorder: AsyncStateTraceRecorder | None = None
+        if enable_generation_state_metrics:
+            worker_idx_env = os.environ.get(NRL_RAY_WORKER_IDX_ENV, "").strip()
+            assert worker_idx_env, (
+                f"{NRL_RAY_WORKER_IDX_ENV} must be set when generation state metrics are enabled"
+            )
+            self._async_state_trace_recorder = AsyncStateTraceRecorder(
+                worker_idx=int(worker_idx_env)
+            )
             self._start_vllm_metrics_logger()
 
     def _start_vllm_metrics_logger(self) -> None:
@@ -196,50 +215,50 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         if not getattr(self, "is_model_owner", False):
             return
 
-        assert "vllm_metrics_logger_interval" in self.cfg["vllm_cfg"], (
-            "vllm_metrics_logger_interval must be set in vllm_cfg if enable_vllm_metrics_logger is True"
-        )
-        interval_s = self.cfg["vllm_cfg"]["vllm_metrics_logger_interval"]
-        assert interval_s > 0, (
-            f"vllm_metrics_logger_interval must be a positive float, got {interval_s}"
-        )
+        interval_s = get_generation_state_metrics_interval(self.cfg["vllm_cfg"])
 
         # Lazy import inside thread target to avoid import overhead if disabled
         stop_event = threading.Event()
         self._vllm_metrics_logger_stop_event = stop_event
 
-        self.inflight_batch_sizes: list[int] = []
-        self.num_pending_samples: list[int] = []
-        self.kv_cache_usage_perc: list[float] = []
-        self.generation_tokens: list[int] = []
-
         def _logger_loop():
             # Delay a little to let engine settle
-            time.sleep(min(2.0, interval_s))
-            while True:
+            if stop_event.wait(min(2.0, interval_s)):
+                return
+            while not stop_event.is_set():
                 try:
+                    running_total = 0
+                    waiting_total = 0
+                    kv_cache_usage_perc = 0.0
+                    generation_tokens_counter = 0
                     for m in get_metrics_snapshot():
-                        with self._vllm_metrics_lock:
-                            if isinstance(m, Gauge):
-                                # Log the vllm inflight batch sizes
-                                if m.name == "vllm:num_requests_running":
-                                    self.inflight_batch_sizes.append(int(m.value))
-                                # Log the vllm pending number of requests in the queue
-                                elif m.name == "vllm:num_requests_waiting":
-                                    self.num_pending_samples.append(int(m.value))
-                                # Log the vllm kv cache usage
-                                elif m.name == "vllm:kv_cache_usage_perc":
-                                    self.kv_cache_usage_perc.append(float(m.value))
-                            elif isinstance(m, Counter):
-                                if m.name == "vllm:generation_tokens":
-                                    self.generation_tokens.append(int(m.value))
+                        if isinstance(m, Gauge):
+                            if m.name == "vllm:num_requests_running":
+                                running_total = int(m.value)
+                            elif m.name == "vllm:num_requests_waiting":
+                                waiting_total = int(m.value)
+                            elif m.name == "vllm:kv_cache_usage_perc":
+                                kv_cache_usage_perc = float(m.value)
+                        elif isinstance(m, Counter) and m.name == "vllm:generation_tokens":
+                            generation_tokens_counter = int(m.value)
+
+                    with self._vllm_metrics_lock:
+                        if self._async_state_trace_recorder is not None:
+                            self._async_state_trace_recorder.sample(
+                                running_total=running_total,
+                                waiting_total=waiting_total,
+                                kv_cache_usage_perc=kv_cache_usage_perc,
+                                generation_tokens_counter=generation_tokens_counter,
+                                interval_s=interval_s,
+                            )
                 except Exception:
                     print(
                         "⚠️[vLLM Metric Logger] Exception in vLLM metrics logger",
                         flush=True,
                     )
                     pass
-                time.sleep(interval_s)
+                if stop_event.wait(interval_s):
+                    break
 
         t = threading.Thread(
             target=_logger_loop, name="vllm-metrics-logger", daemon=True
@@ -252,27 +271,69 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         )
 
     def get_vllm_logger_metrics(self) -> dict[str, Any]:
-        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+        if not is_generation_state_metrics_enabled(self.cfg["vllm_cfg"]):
             return {}
 
         with self._vllm_metrics_lock:
-            metric = {
-                "inflight_batch_sizes": copy.deepcopy(self.inflight_batch_sizes),
-                "num_pending_samples": copy.deepcopy(self.num_pending_samples),
-                "kv_cache_usage_perc": copy.deepcopy(self.kv_cache_usage_perc),
-                "generation_tokens": copy.deepcopy(self.generation_tokens),
-            }
-        return metric
+            if self._async_state_trace_recorder is None:
+                return {}
+            return self._async_state_trace_recorder.get_metric_series()
 
     def clear_vllm_logger_metrics(self) -> None:
-        if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
+        if not is_generation_state_metrics_enabled(self.cfg["vllm_cfg"]):
             return
 
         with self._vllm_metrics_lock:
-            self.inflight_batch_sizes = []
-            self.num_pending_samples = []
-            self.kv_cache_usage_perc = []
-            self.generation_tokens = []
+            if self._async_state_trace_recorder is None:
+                return
+            self._async_state_trace_recorder.clear_step_local_metrics()
+
+    def set_async_state_trace_context(
+        self, step: int, generation_pass_idx: int, trace_dir: str
+    ) -> None:
+        if not is_generation_state_metrics_enabled(self.cfg["vllm_cfg"]):
+            return
+
+        with self._vllm_metrics_lock:
+            if self._async_state_trace_recorder is None:
+                return
+            self._async_state_trace_recorder.set_context(
+                step=step,
+                generation_pass_idx=generation_pass_idx,
+                trace_dir=trace_dir,
+            )
+
+    def _record_async_request_submit(
+        self,
+        request_id: str,
+        prompt_len: int,
+        sampled_output_len: int | None,
+    ) -> None:
+        if self._async_state_trace_recorder is None:
+            return
+        with self._vllm_metrics_lock:
+            self._async_state_trace_recorder.on_submit(
+                request_id=request_id,
+                prompt_len=prompt_len,
+                sampled_output_len=sampled_output_len,
+            )
+
+    def _record_async_request_output(
+        self, request_id: str, current_generated_tokens: int
+    ) -> None:
+        if self._async_state_trace_recorder is None:
+            return
+        with self._vllm_metrics_lock:
+            self._async_state_trace_recorder.on_output(
+                request_id=request_id,
+                current_generated_tokens=current_generated_tokens,
+            )
+
+    def _record_async_request_finish(self, request_id: str) -> None:
+        if self._async_state_trace_recorder is None:
+            return
+        with self._vllm_metrics_lock:
+            self._async_state_trace_recorder.on_finish(request_id)
 
     async def post_init_async(self):
         self.vllm_device_ids = await self.report_device_id_async()
@@ -641,6 +702,29 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             ),
         )
 
+    async def start_gpu_profiling(self) -> None:
+        """Start GPU profiling on the internal vLLM worker processes."""
+        if self.llm is not None:
+            result_or_coro = await self.llm.collective_rpc(
+                "start_gpu_profiling", args=tuple()
+            )
+            if asyncio.iscoroutine(result_or_coro):
+                await result_or_coro
+            return
+        # Non-model-owner outer actors do not host AsyncLLM instances. Profiling
+        # start is broadcast across the worker group, so these actors must no-op
+        # instead of trying to profile themselves locally.
+
+    async def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling on the internal vLLM worker processes."""
+        if self.llm is not None:
+            result_or_coro = await self.llm.collective_rpc(
+                "stop_gpu_profiling", args=tuple()
+            )
+            if asyncio.iscoroutine(result_or_coro):
+                await result_or_coro
+            return
+
     async def generate_async(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
@@ -699,10 +783,21 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             remaining_ctx = (
                 self.cfg["vllm_cfg"]["max_model_len"] - current_input_actual_length
             )
-            allowed_new_tokens = max(0, min(self.cfg["max_new_tokens"], remaining_ctx))
+            output_length_resolution = self._resolve_allowed_new_tokens(
+                remaining_ctx=remaining_ctx
+            )
+            allowed_new_tokens = output_length_resolution.allowed_new_tokens
 
             # Handle case where no tokens can be generated due to length constraints
             if allowed_new_tokens == 0:
+                request_id = str(uuid.uuid4())
+                self._record_async_request_submit(
+                    request_id=request_id,
+                    prompt_len=current_input_actual_length,
+                    sampled_output_len=output_length_resolution.sampled_output_length,
+                )
+                self._record_async_request_finish(request_id)
+
                 # Access the input data directly from the function parameters
                 input_ids_single_row = input_ids_batch[sample_idx]
 
@@ -733,6 +828,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                         "logprobs": logprobs_single_item,
                         "generation_lengths": generation_lengths_tensor,
                         "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                        **self._build_output_length_metadata(
+                            output_length_resolution,
+                            device=input_ids_single_row.device,
+                        ),
                     }
                 )
 
@@ -745,18 +844,33 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             )
 
             request_id = str(uuid.uuid4())
-
-            # Generate using vLLM async engine
-            vllm_request_generator = self.llm.generate(
-                prompt=prompt,
-                sampling_params=sampling_params_for_request,
+            self._record_async_request_submit(
                 request_id=request_id,
+                prompt_len=current_input_actual_length,
+                sampled_output_len=output_length_resolution.sampled_output_length,
             )
 
-            # Get the final result from the generator
-            final_request_output = None
-            async for req_output in vllm_request_generator:
-                final_request_output = req_output
+            # Generate using vLLM async engine
+            try:
+                vllm_request_generator = self.llm.generate(
+                    prompt=prompt,
+                    sampling_params=sampling_params_for_request,
+                    request_id=request_id,
+                )
+
+                # Get the final result from the generator
+                final_request_output = None
+                async for req_output in vllm_request_generator:
+                    final_request_output = req_output
+                    if req_output.outputs:
+                        self._record_async_request_output(
+                            request_id=request_id,
+                            current_generated_tokens=len(
+                                req_output.outputs[0].token_ids
+                            ),
+                        )
+            finally:
+                self._record_async_request_finish(request_id)
 
             if final_request_output is None:
                 raise RuntimeError(f"No output received for request {request_id}")
@@ -838,6 +952,10 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     "logprobs": logprobs_single_item,
                     "generation_lengths": generation_lengths_tensor,
                     "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
+                    **self._build_output_length_metadata(
+                        output_length_resolution,
+                        device=original_input_ids_single_row.device,
+                    ),
                 }
             )
 
@@ -905,16 +1023,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 [per_prompt_stop_strings] if per_prompt_stop_strings else None
             )
 
-            # Create sampling parameters
-            top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
-            sampling_params = self.SamplingParams(
-                temperature=self.cfg["temperature"] if not greedy else 0,
-                top_p=self.cfg["top_p"],
-                top_k=top_k if not greedy else 1,
-                max_tokens=self.cfg["max_new_tokens"],
-                stop_token_ids=self.cfg["stop_token_ids"],
-                stop=final_stop_strings,
-                include_stop_str_in_output=True,  # returning stop strings like hf
+            output_length_resolution = self._resolve_allowed_new_tokens()
+            sampling_params = self._build_sampling_params(
+                greedy=greedy,
+                stop_strings=final_stop_strings,
+                max_new_tokens=output_length_resolution.allowed_new_tokens,
             )
 
             request_id = str(uuid.uuid4())
@@ -1116,6 +1229,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            stop_event = getattr(self, "_vllm_metrics_logger_stop_event", None)
+            metrics_thread = getattr(self, "_vllm_metrics_logger_thread", None)
+            if stop_event is not None:
+                stop_event.set()
+            if metrics_thread is not None and metrics_thread.is_alive():
+                metrics_thread.join(timeout=5)
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 await self.llm.collective_rpc("cleanup", args=tuple())

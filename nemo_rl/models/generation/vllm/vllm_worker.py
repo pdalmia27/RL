@@ -16,6 +16,8 @@ import copy
 import gc
 import os
 import sys
+from collections.abc import Mapping
+from dataclasses import dataclass
 from importlib.util import find_spec
 from typing import Any, Optional, cast
 
@@ -30,6 +32,10 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
+from nemo_rl.models.generation.output_length_samplers import (
+    OutputLengthSampler,
+    build_output_length_sampler,
+)
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
 from nemo_rl.models.huggingface.common import ModelFlag
@@ -38,6 +44,15 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
 
 # Use a base class to share some functions to avoid code duplication.
+@dataclass(frozen=True)
+class OutputLengthResolution:
+    allowed_new_tokens: int
+    sampled_output_length: int | None
+    clipped_by_context: bool
+    clipped_by_max_new_tokens: bool
+    zero_token_due_to_context: bool
+
+
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -141,6 +156,8 @@ class BaseVllmGenerationWorker:
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
+        self._output_length_sampler: OutputLengthSampler | None = None
+        self._initialize_output_length_sampler()
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -446,6 +463,97 @@ class BaseVllmGenerationWorker:
 
         return list(stop_set) if stop_set else None
 
+    def _initialize_output_length_sampler(self) -> None:
+        configured_output_length = self.cfg.get("output_len_or_output_len_generator")
+        if (
+            isinstance(configured_output_length, Mapping)
+            and not self.cfg["vllm_cfg"]["async_engine"]
+        ):
+            raise NotImplementedError(
+                "Per-request synthetic output-length distributions are only supported with async vLLM in v1."
+            )
+        self._output_length_sampler = build_output_length_sampler(
+            configured_output_length
+        )
+
+    def _get_effective_stop_token_ids(self) -> list[int] | None:
+        stop_token_ids = self.cfg["stop_token_ids"]
+        if not stop_token_ids or not self.cfg.get("ignore_eos", False):
+            return stop_token_ids
+
+        eos_token_id = self.cfg.get("_eos_token_id")
+        if eos_token_id is None:
+            return stop_token_ids
+
+        filtered_stop_token_ids = [
+            token_id for token_id in stop_token_ids if token_id != eos_token_id
+        ]
+        return filtered_stop_token_ids or None
+
+    def _resolve_allowed_new_tokens(
+        self,
+        *,
+        remaining_ctx: Optional[int] = None,
+        max_new_tokens: Optional[int] = None,
+    ) -> OutputLengthResolution:
+        max_tokens_cfg = (
+            self.cfg["max_new_tokens"] if max_new_tokens is None else max_new_tokens
+        )
+        sampled_output_length = (
+            self._output_length_sampler.sample_one()
+            if self._output_length_sampler is not None
+            else None
+        )
+        clipped_by_max_new_tokens = (
+            sampled_output_length is not None and sampled_output_length > max_tokens_cfg
+        )
+        requested_new_tokens = (
+            min(max_tokens_cfg, sampled_output_length)
+            if sampled_output_length is not None
+            else max_tokens_cfg
+        )
+
+        clipped_by_context = False
+        zero_token_due_to_context = False
+        if remaining_ctx is not None:
+            clipped_by_context = requested_new_tokens > remaining_ctx
+            requested_new_tokens = min(requested_new_tokens, remaining_ctx)
+            zero_token_due_to_context = remaining_ctx <= 0
+
+        return OutputLengthResolution(
+            allowed_new_tokens=max(0, requested_new_tokens),
+            sampled_output_length=sampled_output_length,
+            clipped_by_context=clipped_by_context,
+            clipped_by_max_new_tokens=clipped_by_max_new_tokens,
+            zero_token_due_to_context=zero_token_due_to_context,
+        )
+
+    def _build_output_length_metadata(
+        self,
+        resolution: OutputLengthResolution,
+        *,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        if resolution.sampled_output_length is None:
+            return {}
+
+        return {
+            "sampled_output_lengths": torch.tensor(
+                [resolution.sampled_output_length], dtype=torch.long, device=device
+            ),
+            "output_length_clipped_by_context": torch.tensor(
+                [resolution.clipped_by_context], dtype=torch.bool, device=device
+            ),
+            "output_length_clipped_by_max_new_tokens": torch.tensor(
+                [resolution.clipped_by_max_new_tokens],
+                dtype=torch.bool,
+                device=device,
+            ),
+            "zero_token_generations_due_to_context": torch.tensor(
+                [resolution.zero_token_due_to_context], dtype=torch.bool, device=device
+            ),
+        }
+
     def _build_sampling_params(
         self,
         *,
@@ -458,9 +566,10 @@ class BaseVllmGenerationWorker:
 
         temperature = 0.0 if greedy else self.cfg["temperature"]
 
-        max_tokens = (
-            max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
-        )
+        if max_new_tokens is None:
+            max_tokens = self._resolve_allowed_new_tokens().allowed_new_tokens
+        else:
+            max_tokens = max_new_tokens
 
         return self.SamplingParams(
             temperature=temperature,
@@ -468,22 +577,29 @@ class BaseVllmGenerationWorker:
             top_k=top_k_val,
             max_tokens=max_tokens,
             logprobs=0,
-            stop_token_ids=self.cfg["stop_token_ids"],
+            stop_token_ids=self._get_effective_stop_token_ids(),
             stop=stop_strings,
             include_stop_str_in_output=True,
+            ignore_eos=self.cfg.get("ignore_eos", False),
         )
 
     def start_gpu_profiling(self) -> None:
         """Start GPU profiling."""
-        torch.cuda.profiler.start()
+        # For vLLM, the useful NSYS traces come from the internal worker processes.
+        # Starting profiling in the outer actor can OOM on large runs before the
+        # collective RPC reaches those internal workers.
         if self.llm is not None:
             self.llm.collective_rpc("start_gpu_profiling", args=tuple())
+            return
+        # Non-model-owner outer actors do not host vLLM engines. Profiling start
+        # is broadcast across the whole worker group, so these actors must no-op
+        # instead of trying to profile themselves locally.
 
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
-        torch.cuda.profiler.stop()
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
+            return
 
 
 @ray.remote(
@@ -687,10 +803,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             temperature=self.cfg["temperature"] if not greedy else 0,
             top_p=self.cfg["top_p"],
             top_k=top_k if not greedy else 1,
-            max_tokens=self.cfg["max_new_tokens"],
-            stop_token_ids=self.cfg["stop_token_ids"],
+            max_tokens=self._resolve_allowed_new_tokens().allowed_new_tokens,
+            stop_token_ids=self._get_effective_stop_token_ids(),
             stop=stop_strings,
             include_stop_str_in_output=True,  # returning stop strings like hf
+            ignore_eos=self.cfg.get("ignore_eos", False),
         )
 
         # Generate outputs

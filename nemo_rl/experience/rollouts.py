@@ -53,6 +53,21 @@ from nemo_rl.utils.timer import Timer
 TokenizerType = PreTrainedTokenizerBase
 
 
+def _calculate_length_summary_metrics(
+    values: list[int], prefix: str
+) -> dict[str, float | int]:
+    if not values:
+        return {}
+
+    values_tensor = torch.tensor(values, dtype=torch.float32)
+    return {
+        f"{prefix}/mean": values_tensor.mean().item(),
+        f"{prefix}/p50": values_tensor.quantile(0.5).item(),
+        f"{prefix}/p95": values_tensor.quantile(0.95).item(),
+        f"{prefix}/max": int(values_tensor.max().item()),
+    }
+
+
 def generate_responses(
     policy_generation: GenerationInterface,
     generation_input_data: BatchedDataDict[GenerationDatumSpec],
@@ -109,10 +124,19 @@ def generate_responses(
         batch["message_log"][i].append(assistant_message)
 
     # Generation metrics
+    generation_lengths_list = (
+        generation_lengths.reshape(-1).to(torch.long).cpu().tolist()
+    )
     gen_metrics = {
         "mean_generation_length": generation_lengths.float().mean().item(),
         "total_generated_tokens": generation_lengths.sum().item(),
+        "histogram/actual_generation_length": generation_lengths_list,
     }
+    gen_metrics.update(
+        _calculate_length_summary_metrics(
+            generation_lengths_list, "actual_generation_length"
+        )
+    )
 
     return batch, generated_ids, gen_metrics
 
@@ -204,10 +228,51 @@ async def generate_responses_async(
         batch["message_log"][i].append(assistant_message)
 
     # Generation metrics
+    generation_lengths_list = (
+        generation_lengths.reshape(-1).to(torch.long).cpu().tolist()
+    )
     gen_metrics = {
         "mean_generation_length": generation_lengths.float().mean().item(),
         "total_generated_tokens": generation_lengths.sum().item(),
+        "histogram/actual_generation_length": generation_lengths_list,
     }
+    gen_metrics.update(
+        _calculate_length_summary_metrics(
+            generation_lengths_list, "actual_generation_length"
+        )
+    )
+    sampled_output_lengths = generation_outputs.get("sampled_output_lengths")
+    if sampled_output_lengths is not None:
+        sampled_output_lengths_list = (
+            sampled_output_lengths.reshape(-1).to(torch.long).cpu().tolist()
+        )
+        gen_metrics["histogram/sampled_output_length"] = sampled_output_lengths_list
+        gen_metrics.update(
+            _calculate_length_summary_metrics(
+                sampled_output_lengths_list, "sampled_output_length"
+            )
+        )
+        output_length_clipped_by_context = generation_outputs.get(
+            "output_length_clipped_by_context"
+        )
+        if output_length_clipped_by_context is not None:
+            gen_metrics["num_output_length_clipped_by_context"] = int(
+                output_length_clipped_by_context.to(torch.int64).sum().item()
+            )
+        output_length_clipped_by_max_new_tokens = generation_outputs.get(
+            "output_length_clipped_by_max_new_tokens"
+        )
+        if output_length_clipped_by_max_new_tokens is not None:
+            gen_metrics["num_output_length_clipped_by_max_new_tokens"] = int(
+                output_length_clipped_by_max_new_tokens.to(torch.int64).sum().item()
+            )
+        zero_token_generations_due_to_context = generation_outputs.get(
+            "zero_token_generations_due_to_context"
+        )
+        if zero_token_generations_due_to_context is not None:
+            gen_metrics["num_zero_token_generations_due_to_context"] = int(
+                zero_token_generations_due_to_context.to(torch.int64).sum().item()
+            )
     # Attach worker metadata if present (async vLLM path)
     if "gen_leader_worker_idx" in generation_outputs:
         # generation_outputs carries this as a 1-length list per row; convert to int
@@ -656,8 +721,12 @@ async def run_sample_multi_turn_rollout(
     turn_gen_tokens = []
     turn_input_tokens = []
     turn_total_tokens = []
+    turn_sampled_output_lengths = []
     # Track per-turn per-worker token accounting if available
     per_worker_token_counts = {}  # worker_idx -> token_count
+    output_length_clipped_by_context_count = 0
+    output_length_clipped_by_max_new_tokens_count = 0
+    zero_token_generations_due_to_context_count = 0
 
     for turn in range(max_rollout_turns):
         if terminated or truncated:
@@ -695,6 +764,19 @@ async def run_sample_multi_turn_rollout(
                 per_worker_token_counts[worker_idx] = (
                     per_worker_token_counts.get(worker_idx, 0) + gen_token_count
                 )
+            if "histogram/sampled_output_length" in gen_metrics:
+                turn_sampled_output_lengths.extend(
+                    gen_metrics["histogram/sampled_output_length"]
+                )
+            output_length_clipped_by_context_count += int(
+                gen_metrics.get("num_output_length_clipped_by_context", 0)
+            )
+            output_length_clipped_by_max_new_tokens_count += int(
+                gen_metrics.get("num_output_length_clipped_by_max_new_tokens", 0)
+            )
+            zero_token_generations_due_to_context_count += int(
+                gen_metrics.get("num_zero_token_generations_due_to_context", 0)
+            )
 
         except Exception as e:
             print(f"Error generating response for sample {sample_idx}: {e}")
@@ -776,6 +858,10 @@ async def run_sample_multi_turn_rollout(
         "turn_gen_tokens": turn_gen_tokens,
         "turn_input_tokens": turn_input_tokens,
         "turn_total_tokens": turn_total_tokens,
+        "turn_sampled_output_lengths": turn_sampled_output_lengths,
+        "output_length_clipped_by_context_count": output_length_clipped_by_context_count,
+        "output_length_clipped_by_max_new_tokens_count": output_length_clipped_by_max_new_tokens_count,
+        "zero_token_generations_due_to_context_count": zero_token_generations_due_to_context_count,
         # Pass-through per-worker per-turn accounting for aggregation at batch level
         "per_worker_token_counts": per_worker_token_counts,
     }
@@ -937,15 +1023,46 @@ def run_async_multi_turn_rollout(
             rollout_metrics["per_worker_token_counts"] = per_worker_token_counts
 
         # Collect ISL, OSL, and ISL+OSL metrics for all samples
-        rollout_metrics["histogram/gen_tokens_length"] = [
+        actual_generation_lengths = [
             t for m in all_sample_metrics for t in m["turn_gen_tokens"]
         ]
+        rollout_metrics["histogram/gen_tokens_length"] = actual_generation_lengths
+        rollout_metrics["histogram/actual_generation_length"] = (
+            actual_generation_lengths
+        )
+        rollout_metrics.update(
+            _calculate_length_summary_metrics(
+                actual_generation_lengths, "actual_generation_length"
+            )
+        )
         rollout_metrics["histogram/input_tokens_length"] = [
             t for m in all_sample_metrics for t in m["turn_input_tokens"]
         ]
         rollout_metrics["histogram/total_tokens_length"] = [
             t for m in all_sample_metrics for t in m["turn_total_tokens"]
         ]
+        sampled_output_lengths = [
+            t for m in all_sample_metrics for t in m["turn_sampled_output_lengths"]
+        ]
+        if sampled_output_lengths:
+            rollout_metrics["histogram/sampled_output_length"] = sampled_output_lengths
+            rollout_metrics.update(
+                _calculate_length_summary_metrics(
+                    sampled_output_lengths, "sampled_output_length"
+                )
+            )
+            rollout_metrics["num_output_length_clipped_by_context"] = sum(
+                m["output_length_clipped_by_context_count"]
+                for m in all_sample_metrics
+            )
+            rollout_metrics["num_output_length_clipped_by_max_new_tokens"] = sum(
+                m["output_length_clipped_by_max_new_tokens_count"]
+                for m in all_sample_metrics
+            )
+            rollout_metrics["num_zero_token_generations_due_to_context"] = sum(
+                m["zero_token_generations_due_to_context_count"]
+                for m in all_sample_metrics
+            )
 
         return final_batch, rollout_metrics
 

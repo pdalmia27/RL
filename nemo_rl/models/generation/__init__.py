@@ -26,6 +26,8 @@ def configure_generation_config(
     config: GenerationConfig, tokenizer: TokenizerType, is_eval=False
 ) -> GenerationConfig:
     """Apply specific configurations to generation config."""
+    config.setdefault("ignore_eos", False)
+    config.setdefault("output_len_or_output_len_generator", None)
     # tokenizer setting
     if "_pad_token_id" in config:
         warnings.warn(
@@ -34,7 +36,8 @@ def configure_generation_config(
             UserWarning,
         )
     config["_pad_token_id"] = tokenizer.pad_token_id
-    if config["stop_token_ids"] is None:
+    config["_eos_token_id"] = tokenizer.eos_token_id
+    if not config["ignore_eos"] and config["stop_token_ids"] is None:
         config["stop_token_ids"] = [tokenizer.eos_token_id]
 
     # vllm setting

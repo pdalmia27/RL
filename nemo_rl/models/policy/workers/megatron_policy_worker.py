@@ -120,7 +120,10 @@ from nemo_rl.models.megatron.common import (
     forward_step_arbitrary_loss,
     get_moe_metrics,
 )
-from nemo_rl.models.megatron.community_import import import_model_from_hf_name
+from nemo_rl.models.megatron.community_import import (
+    import_model_from_hf_name,
+    resolve_hf_model_name_or_path,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
     ColocatablePolicyInterface,
@@ -590,6 +593,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
             pretrained_path, "iter_0000000/run_config.yaml"
         )
 
+        resolved_hf_model_name = resolve_hf_model_name_or_path(hf_model_name)
+
         self.tokenizer = tokenizer
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -951,7 +956,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         tokenizer_config = TokenizerConfig(
             tokenizer_type="HuggingFaceTokenizer",
-            tokenizer_model=hf_model_name,
+            tokenizer_model=resolved_hf_model_name,
         )
 
         self.megatron_tokenizer = build_tokenizer(
@@ -970,7 +975,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         )
         self.dp_size = worker_sharding_annotations.get_axis_size("data_parallel")
         self.megatron_bridge = AutoBridge.from_hf_pretrained(
-            hf_model_name, trust_remote_code=True
+            resolved_hf_model_name, trust_remote_code=True
         )
 
         self.should_disable_forward_pre_hook = (

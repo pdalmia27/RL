@@ -28,7 +28,13 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
-from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+from nemo_rl.distributed.worker_group_utils import (
+    NRL_RAY_WORKER_IDX_ENV,
+    get_nsight_config_if_pattern_matches,
+    get_nsight_worker_name_for_actor_class,
+    is_vllm_worker_nsight_index_filter_enabled,
+    recursive_merge_options,
+)
 from nemo_rl.utils.venvs import (
     create_local_venv_on_each_node,
 )
@@ -240,7 +246,10 @@ class RayWorkerBuilder:
         """
         # Set up worker arguments and resources
         options = deepcopy(extra_options)
-        initializer_options = {"runtime_env": options["runtime_env"]}
+        initializer_runtime_env = deepcopy(options["runtime_env"])
+        initializer_runtime_env.pop("nsight", None)
+        initializer_runtime_env.pop("_nsight", None)
+        initializer_options = {"runtime_env": initializer_runtime_env}
         isolated_initializer = self.IsolatedWorkerInitializer.options(  # type: ignore # @ray.remote call
             **initializer_options
         ).remote(self.ray_actor_class_fqn, *self.args, **self.kwargs)
@@ -483,6 +492,7 @@ class RayWorkerGroup:
             is_parallel_group = len(local_bundle_indices) > 1
 
             for local_rank, bundle_idx in enumerate(local_bundle_indices):
+                worker_idx = len(worker_futures)
                 # Set up basic distributed environment variables
                 worker_env_vars = deepcopy(env_vars)
                 worker_env_vars.update(
@@ -495,6 +505,7 @@ class RayWorkerGroup:
                         "NODE_RANK": str(pg_idx),
                         "AVAILABLE_ADDR_LIST": str(available_addresses),
                         "AVAILABLE_PORT_LIST": str(available_ports),
+                        NRL_RAY_WORKER_IDX_ENV: str(worker_idx),
                     }
                 )
                 # Remove Ray-specific environment variables, let the worker itself set them.
@@ -533,6 +544,18 @@ class RayWorkerGroup:
                 }
                 runtime_env["env_vars"]["VIRTUAL_ENV"] = py_executable
                 runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
+                nsight_worker_name = get_nsight_worker_name_for_actor_class(
+                    remote_worker_builder.ray_actor_class_fqn
+                )
+                if (
+                    nsight_worker_name is not None
+                    and is_vllm_worker_nsight_index_filter_enabled()
+                ):
+                    runtime_env.update(
+                        get_nsight_config_if_pattern_matches(
+                            nsight_worker_name, worker_idx=worker_idx
+                        )
+                    )
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 
@@ -546,7 +569,6 @@ class RayWorkerGroup:
                 )
 
                 # Store the future and metadata
-                worker_idx = len(worker_futures)
                 worker_futures.append((worker_future, initializer))
                 worker_info.append(
                     {
