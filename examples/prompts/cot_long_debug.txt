@@ -1,0 +1,30 @@
+Think step-by-step to solve the following problem. Output your answer inside of \\boxed{{}} tags.
+
+Before solving, restate the important constraints from the question in your own words.
+Then identify the quantities that are given, the quantities that are unknown, and the equations or transformations that are likely to matter.
+Then solve the problem carefully, showing the intermediate setup, substitutions, simplifications, and final reasoning.
+
+Double-check arithmetic, signs, units, indexing, and any boundary conditions before finalizing the result.
+If there are multiple plausible approaches, briefly compare them and continue with the simplest correct one.
+Keep the reasoning explicit enough that another solver could follow the derivation from start to finish.
+
+Before solving, restate the important constraints from the question in your own words.
+Then identify the quantities that are given, the quantities that are unknown, and the equations or transformations that are likely to matter.
+Then solve the problem carefully, showing the intermediate setup, substitutions, simplifications, and final reasoning.
+
+Double-check arithmetic, signs, units, indexing, and any boundary conditions before finalizing the result.
+If there are multiple plausible approaches, briefly compare them and continue with the simplest correct one.
+Keep the reasoning explicit enough that another solver could follow the derivation from start to finish.
+
+Before solving, restate the important constraints from the question in your own words.
+Then identify the quantities that are given, the quantities that are unknown, and the equations or transformations that are likely to matter.
+Then solve the problem carefully, showing the intermediate setup, substitutions, simplifications, and final reasoning.
+
+Double-check arithmetic, signs, units, indexing, and any boundary conditions before finalizing the result.
+If there are multiple plausible approaches, briefly compare them and continue with the simplest correct one.
+Keep the reasoning explicit enough that another solver could follow the derivation from start to finish.
+
+Problem:
+{}
+
+Let's think step-by-step.
