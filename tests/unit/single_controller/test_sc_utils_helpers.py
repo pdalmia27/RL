@@ -23,6 +23,7 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.single_controller_utils.utils import (
+    ImportanceSamplingDiagnosticsAccumulator,
     aggregate_step_metrics,
     fields_for_put,
     reduce_advantage_pump_metrics,
@@ -159,6 +160,124 @@ class TestReduceAdvantagePumpMetrics:
 
     def test_all_empty_inputs_returns_empty_dict(self) -> None:
         assert reduce_advantage_pump_metrics([], [], []) == {}
+
+
+class TestImportanceSamplingDiagnosticsAccumulator:
+    def test_reports_raw_log_ratios_by_lag_and_sequence(self) -> None:
+        accumulator = ImportanceSamplingDiagnosticsAccumulator(
+            use_importance_sampling_correction=True,
+            sequence_level_importance_ratios=False,
+            truncated_importance_sampling_ratio=2.0,
+            truncated_importance_sampling_ratio_min=None,
+            truncated_importance_sampling_type="tis",
+        )
+        log_2 = math.log(2.0)
+        log_4 = math.log(4.0)
+        accumulator.record(
+            step=3,
+            trainer_version=2,
+            sample_ids=["prompt-a_g0", "prompt-b_g0"],
+            rollout_weight_versions=[2, 0],
+            sequence_lengths=[4, 4],
+            prev_logprobs=torch.tensor(
+                [[0.0, log_2, 0.0, -log_2], [0.0, log_4, log_4, log_4]]
+            ),
+            generation_logprobs=torch.zeros(2, 4),
+            token_mask=torch.ones(2, 4),
+            sample_mask=torch.ones(2),
+            advantages=torch.tensor([[0.0, 1.0, 1.0, 1.0], [0.0, 0.5, 0.5, 0.5]]),
+            rewards=torch.tensor([0.25, 1.0]),
+        )
+
+        metrics, rows = accumulator.flush()
+
+        assert metrics["importance_sampling/all/num_sequences"] == 2
+        assert metrics["importance_sampling/all/num_tokens"] == 6
+        assert metrics["importance_sampling/lag_0/num_sequences"] == 1
+        assert metrics["importance_sampling/lag_2/num_sequences"] == 1
+        assert metrics["importance_sampling/lag_0/raw_token_log_ratio_p50"] == (
+            pytest.approx(0.0)
+        )
+        assert metrics[
+            "importance_sampling/lag_0/raw_token_abs_log_ratio_mean"
+        ] == pytest.approx(2 * log_2 / 3)
+        assert metrics["importance_sampling/lag_2/post_tis_ratio_mean"] == (
+            pytest.approx(2.0)
+        )
+        assert metrics["importance_sampling/lag_2/tis_oob_fraction"] == (
+            pytest.approx(1.0)
+        )
+        assert metrics[
+            "importance_sampling/lag_2/objective_signal_proxy_mean"
+        ] == pytest.approx(1.0)
+        assert rows[0]["prompt_group_id"] == "prompt-a"
+        assert rows[0]["observed_lag"] == 0
+        assert rows[1]["observed_lag"] == 2
+        assert rows[0]["reward"] == pytest.approx(0.25)
+        assert rows[0]["raw_sequence_sum_log_ratio"] == pytest.approx(0.0)
+        assert rows[1]["finite_log_ratio_token_count"] == 3
+        assert rows[1]["nonfinite_log_ratio_token_count"] == 0
+        assert accumulator.flush() == ({}, [])
+
+    def test_signal_proxy_uses_unit_weights_when_correction_is_disabled(self) -> None:
+        accumulator = ImportanceSamplingDiagnosticsAccumulator(
+            use_importance_sampling_correction=False,
+            sequence_level_importance_ratios=False,
+            truncated_importance_sampling_ratio=2.0,
+            truncated_importance_sampling_ratio_min=None,
+            truncated_importance_sampling_type="tis",
+        )
+        accumulator.record(
+            step=1,
+            trainer_version=1,
+            sample_ids=["prompt_g0"],
+            rollout_weight_versions=[0],
+            sequence_lengths=[3],
+            prev_logprobs=torch.tensor([[0.0, math.log(4.0), math.log(4.0)]]),
+            generation_logprobs=torch.zeros(1, 3),
+            token_mask=torch.ones(1, 3),
+            sample_mask=torch.ones(1),
+            advantages=torch.tensor([[0.0, 2.0, 2.0]]),
+            rewards=torch.tensor([0.5]),
+        )
+
+        metrics, _ = accumulator.flush()
+
+        assert metrics["importance_sampling/lag_1/post_tis_ratio_mean"] == (
+            pytest.approx(2.0)
+        )
+        assert metrics[
+            "importance_sampling/lag_1/objective_signal_proxy_mean"
+        ] == pytest.approx(2.0)
+
+    def test_sequence_mask_uses_geometric_mean_ratio(self) -> None:
+        accumulator = ImportanceSamplingDiagnosticsAccumulator(
+            use_importance_sampling_correction=True,
+            sequence_level_importance_ratios=False,
+            truncated_importance_sampling_ratio=1.2,
+            truncated_importance_sampling_ratio_min=0.8,
+            truncated_importance_sampling_type="seq-mask-tis",
+        )
+        accumulator.record(
+            step=1,
+            trainer_version=1,
+            sample_ids=["prompt_g0"],
+            rollout_weight_versions=[0],
+            sequence_lengths=[3],
+            prev_logprobs=torch.tensor([[0.0, math.log(2.0), math.log(0.5)]]),
+            generation_logprobs=torch.zeros(1, 3),
+            token_mask=torch.ones(1, 3),
+            sample_mask=torch.ones(1),
+            advantages=torch.tensor([[0.0, 1.0, 1.0]]),
+            rewards=torch.tensor([1.0]),
+        )
+
+        metrics, _ = accumulator.flush()
+
+        assert metrics["importance_sampling/lag_1/tis_oob_fraction"] == 0.0
+        assert metrics[
+            "importance_sampling/lag_1/objective_signal_proxy_mean"
+        ] == pytest.approx(1.25)
 
 
 class TestFieldsForPut:

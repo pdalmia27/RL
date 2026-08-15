@@ -194,6 +194,9 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
+    # Log lag-bucketed token/sequence importance-sampling diagnostics and JSONL rows.
+    # May require a policy-logprob pass that would otherwise be skipped.
+    importance_sampling_diagnostics: bool = False
 
     @model_validator(mode="after")
     def _check_watchdog_outlasts_rollouts(self) -> "AsyncRLConfig":
@@ -406,4 +409,5 @@ class AdvantageConfig:
     sample_mask_field: str = "sample_mask"
     repeated_batch_fields: list[str] = field(default_factory=list)
     policy_logprobs_field: str = "prev_logprobs"
+    generation_logprobs_field: str = "generation_logprobs"
     reference_logprobs_field: str = "reference_policy_logprobs"

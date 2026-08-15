@@ -110,10 +110,11 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
             num_prompts_per_step=2,
             num_generations_per_prompt=4,
         ),
-        loss_fn=ClippedPGLossConfig(force_on_policy_ratio=False),
+        loss_fn=ClippedPGLossConfig(force_on_policy_ratio=True),
         async_rl=AsyncRLConfig(
             min_groups_for_streaming_train=1,
             max_buffered_rollouts=4,
+            importance_sampling_diagnostics=True,
         ),
         logger={},
         env={},
@@ -139,13 +140,15 @@ def test_logs_hyperparameters_and_concrete_weight_synchronizer(
     )
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
 
-    controller_cls(
+    controller = controller_cls(
         master_config=master_config,
         actor_args=actor_args,
         setup_timing_metrics=SetupTimingMetrics(),
     )
 
     logger.log_hyperparams.assert_called_once_with(master_config.model_dump())
+    assert controller._policy_logprobs_required
+    assert "generation_logprobs" in controller._advantage_input_fields()
     output = capsys.readouterr().out
     assert "weight_sync=FakeWeightSynchronizer" in output
     assert "transport=stub" not in output

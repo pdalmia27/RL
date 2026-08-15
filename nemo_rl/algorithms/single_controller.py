@@ -35,6 +35,7 @@ Data flow:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from functools import partial
@@ -54,6 +55,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.algorithms.single_controller_utils.utils import (
+    ImportanceSamplingDiagnosticsAccumulator,
     aggregate_step_metrics,
     fields_for_put,
     reduce_advantage_pump_metrics,
@@ -112,9 +114,33 @@ class SingleControllerActor:
 
         self._master_config = master_config
         self._async_cfg = master_config.async_rl
-        self._policy_logprobs_required = not (
-            master_config.loss_fn.force_on_policy_ratio
-            and master_config.grpo.seq_logprob_error_threshold is None
+        self._importance_sampling_diagnostics = (
+            ImportanceSamplingDiagnosticsAccumulator(
+                use_importance_sampling_correction=(
+                    master_config.loss_fn.use_importance_sampling_correction
+                ),
+                sequence_level_importance_ratios=(
+                    master_config.loss_fn.sequence_level_importance_ratios
+                ),
+                truncated_importance_sampling_ratio=(
+                    master_config.loss_fn.truncated_importance_sampling_ratio
+                ),
+                truncated_importance_sampling_ratio_min=(
+                    master_config.loss_fn.truncated_importance_sampling_ratio_min
+                ),
+                truncated_importance_sampling_type=(
+                    master_config.loss_fn.truncated_importance_sampling_type
+                ),
+            )
+            if self._async_cfg.importance_sampling_diagnostics
+            else None
+        )
+        self._policy_logprobs_required = (
+            not (
+                master_config.loss_fn.force_on_policy_ratio
+                and master_config.grpo.seq_logprob_error_threshold is None
+            )
+            or self._importance_sampling_diagnostics is not None
         )
         self._reference_logprobs_required = not bool(
             master_config.grpo.skip_reference_policy_logprobs_calculation
@@ -635,9 +661,23 @@ class SingleControllerActor:
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
+                diagnostic_rows: list[dict[str, Any]] = []
+                if self._importance_sampling_diagnostics is not None:
+                    diagnostic_metrics, diagnostic_rows = (
+                        self._importance_sampling_diagnostics.flush()
+                    )
+                    step_metrics.update(diagnostic_metrics)
 
                 self._trainer_version += 1
                 self._train_steps += 1
+                if diagnostic_rows:
+                    self._logger.log_string_list_as_jsonl(
+                        [json.dumps(row, sort_keys=True) for row in diagnostic_rows],
+                        (
+                            "importance_sampling/"
+                            f"train_data_step{self._train_steps}.jsonl"
+                        ),
+                    )
                 with self._timer.time("weight_sync"):
                     calibration_data = (
                         BatchedDataDict.from_batches(calibration_batches)
@@ -1082,6 +1122,28 @@ class SingleControllerActor:
         self._step_log_dict["masked_advantages"].append(
             response_advantages.detach().cpu()
         )
+        if self._importance_sampling_diagnostics is not None:
+            if meta.tags is None:
+                raise ValueError(
+                    "importance-sampling diagnostics require rollout weight-version tags"
+                )
+            self._importance_sampling_diagnostics.record(
+                step=self._train_steps + 1,
+                trainer_version=self._trainer_version,
+                sample_ids=list(meta.sample_ids),
+                rollout_weight_versions=[
+                    int(tag["weight_version"]) for tag in meta.tags
+                ],
+                sequence_lengths=meta.sequence_lengths,
+                prev_logprobs=tensor_field(data, adv_cfg.policy_logprobs_field),
+                generation_logprobs=tensor_field(
+                    data, adv_cfg.generation_logprobs_field
+                ),
+                token_mask=token_mask,
+                sample_mask=sample_mask,
+                advantages=advantages,
+                rewards=rewards,
+            )
 
         await self._call_dp(
             "put_samples",
@@ -1107,6 +1169,8 @@ class SingleControllerActor:
         ]
         if self._policy_logprobs_required:
             fields.append(adv_cfg.policy_logprobs_field)
+        if self._importance_sampling_diagnostics is not None:
+            fields.append(adv_cfg.generation_logprobs_field)
         if self._reference_logprobs_required:
             fields.append(adv_cfg.reference_logprobs_field)
         return list(dict.fromkeys(fields))

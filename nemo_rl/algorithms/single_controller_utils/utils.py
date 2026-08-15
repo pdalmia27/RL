@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -41,6 +43,309 @@ _MB_METRIC_MEAN: frozenset[str] = frozenset(
         "mean_prompt_length",
     }
 )
+
+
+@dataclass
+class ImportanceSamplingDiagnosticsAccumulator:
+    """Accumulate raw actor/behavior log-ratio diagnostics for one train step."""
+
+    use_importance_sampling_correction: bool
+    sequence_level_importance_ratios: bool
+    truncated_importance_sampling_ratio: float | None
+    truncated_importance_sampling_ratio_min: float | None
+    truncated_importance_sampling_type: str | None
+    _rows: list[dict[str, Any]] = field(default_factory=list, init=False)
+    _token_log_ratios_by_lag: dict[int, list[torch.Tensor]] = field(
+        default_factory=dict, init=False
+    )
+
+    @staticmethod
+    def _quantiles(values: torch.Tensor, qs: tuple[float, ...]) -> list[float]:
+        if values.numel() == 0:
+            return [0.0] * len(qs)
+        quantiles = torch.quantile(values.float(), torch.tensor(qs))
+        return [float(value) for value in quantiles]
+
+    def _post_tis_weights(
+        self, log_ratios: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        upper = self.truncated_importance_sampling_ratio
+        lower = self.truncated_importance_sampling_ratio_min
+        tis_type = self.truncated_importance_sampling_type
+        raw_token_weights = torch.nan_to_num(
+            torch.exp(log_ratios), nan=0.0, posinf=0.0, neginf=0.0
+        )
+
+        def outside_bounds(value: torch.Tensor) -> bool:
+            return bool(
+                (upper is not None and value > math.log(upper))
+                or (lower is not None and lower > 0 and value < math.log(lower))
+            )
+
+        if self.sequence_level_importance_ratios:
+            sequence_log_ratio = log_ratios.sum()
+            sequence_weight = torch.nan_to_num(
+                torch.exp(sequence_log_ratio), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            raw_weights = sequence_weight.expand_as(raw_token_weights)
+            oob = torch.full_like(
+                log_ratios,
+                outside_bounds(sequence_log_ratio),
+                dtype=torch.bool,
+            )
+        elif tis_type == "seq-mask-tis":
+            sequence_mean_log_ratio = log_ratios.mean()
+            raw_weights = raw_token_weights
+            oob = torch.full_like(
+                log_ratios,
+                outside_bounds(sequence_mean_log_ratio),
+                dtype=torch.bool,
+            )
+        else:
+            raw_weights = raw_token_weights
+            oob = torch.zeros_like(log_ratios, dtype=torch.bool)
+            if upper is not None:
+                oob |= log_ratios > math.log(upper)
+            if lower is not None and lower > 0:
+                oob |= log_ratios < math.log(lower)
+
+        if tis_type is None:
+            return raw_weights, oob
+        if tis_type == "tis":
+            assert upper is not None
+            return raw_weights.clamp(min=lower or 0.0, max=upper), oob
+        if tis_type == "icepop":
+            return torch.where(oob, torch.zeros_like(raw_weights), raw_weights), oob
+        if tis_type == "seq-mask-tis":
+            if bool(oob.any()):
+                return torch.zeros_like(raw_weights), torch.ones_like(oob)
+            return raw_weights, oob
+        raise ValueError(f"unsupported truncated importance sampling type: {tis_type}")
+
+    def record(
+        self,
+        *,
+        step: int,
+        trainer_version: int,
+        sample_ids: list[str],
+        rollout_weight_versions: list[int],
+        sequence_lengths: list[int] | None,
+        prev_logprobs: torch.Tensor,
+        generation_logprobs: torch.Tensor,
+        token_mask: torch.Tensor,
+        sample_mask: torch.Tensor,
+        advantages: torch.Tensor,
+        rewards: torch.Tensor,
+    ) -> None:
+        """Record one selected sampler tranche before its optimizer update."""
+        log_ratios = (prev_logprobs[:, 1:] - generation_logprobs[:, 1:]).float()
+        valid_mask = token_mask[:, 1:].bool() & sample_mask.bool().unsqueeze(-1)
+        next_token_advantages = advantages[:, 1:].float()
+        batch_size = log_ratios.shape[0]
+        if not (
+            len(sample_ids) == len(rollout_weight_versions) == batch_size
+            and rewards.numel() == batch_size
+            and (sequence_lengths is None or len(sequence_lengths) == batch_size)
+            and all(
+                tensor.shape[0] == batch_size
+                for tensor in (
+                    generation_logprobs,
+                    token_mask,
+                    sample_mask,
+                    advantages,
+                )
+            )
+        ):
+            raise ValueError(
+                "importance-sampling diagnostic batch metadata is misaligned"
+            )
+
+        for i, sample_id in enumerate(sample_ids):
+            response_token_count = int(valid_mask[i].sum())
+            finite_mask = valid_mask[i] & torch.isfinite(log_ratios[i])
+            token_log_ratios = log_ratios[i][finite_mask].detach().cpu()
+            token_advantages = next_token_advantages[i][finite_mask].detach().cpu()
+            finite_token_count = int(token_log_ratios.numel())
+            rollout_version = int(rollout_weight_versions[i])
+            lag = int(trainer_version - rollout_version)
+
+            if finite_token_count > 0:
+                post_tis_weights, oob_mask = self._post_tis_weights(token_log_ratios)
+                objective_weights = (
+                    post_tis_weights
+                    if self.use_importance_sampling_correction
+                    else torch.ones_like(post_tis_weights)
+                )
+                signal_proxy = (token_advantages.abs() * objective_weights).mean()
+                self._token_log_ratios_by_lag.setdefault(lag, []).append(
+                    token_log_ratios
+                )
+                sequence_sum_log_ratio = float(token_log_ratios.sum())
+                sequence_mean_log_ratio = float(token_log_ratios.mean())
+                token_abs_log_ratio_mean = float(token_log_ratios.abs().mean())
+                post_tis_ratio_mean = float(post_tis_weights.mean())
+                tis_oob_fraction = float(oob_mask.float().mean())
+                nonzero_advantage_fraction = float(
+                    token_advantages.ne(0).float().mean()
+                )
+                objective_signal_proxy_mean = float(signal_proxy)
+                token_quantiles = self._quantiles(
+                    token_log_ratios, (0.05, 0.50, 0.95, 0.99)
+                )
+            else:
+                sequence_sum_log_ratio = 0.0
+                sequence_mean_log_ratio = 0.0
+                token_abs_log_ratio_mean = 0.0
+                post_tis_ratio_mean = 0.0
+                tis_oob_fraction = 0.0
+                nonzero_advantage_fraction = 0.0
+                objective_signal_proxy_mean = 0.0
+                token_quantiles = [0.0, 0.0, 0.0, 0.0]
+
+            self._rows.append(
+                {
+                    "step": int(step),
+                    "sample_id": sample_id,
+                    "prompt_group_id": sample_id.rsplit("_g", 1)[0],
+                    "rollout_weight_version": rollout_version,
+                    "trainer_weight_version": int(trainer_version),
+                    "observed_lag": lag,
+                    "total_sequence_length": (
+                        int(sequence_lengths[i])
+                        if sequence_lengths is not None
+                        else None
+                    ),
+                    "response_token_count": response_token_count,
+                    "finite_log_ratio_token_count": finite_token_count,
+                    "nonfinite_log_ratio_token_count": (
+                        response_token_count - finite_token_count
+                    ),
+                    "reward": float(rewards.flatten()[i]),
+                    "raw_sequence_sum_log_ratio": sequence_sum_log_ratio,
+                    "raw_sequence_mean_log_ratio": sequence_mean_log_ratio,
+                    "raw_token_abs_log_ratio_mean": token_abs_log_ratio_mean,
+                    "raw_token_log_ratio_p05": token_quantiles[0],
+                    "raw_token_log_ratio_p50": token_quantiles[1],
+                    "raw_token_log_ratio_p95": token_quantiles[2],
+                    "raw_token_log_ratio_p99": token_quantiles[3],
+                    "post_tis_ratio_mean": post_tis_ratio_mean,
+                    "tis_oob_fraction": tis_oob_fraction,
+                    "nonzero_advantage_fraction": nonzero_advantage_fraction,
+                    "objective_signal_proxy_mean": objective_signal_proxy_mean,
+                }
+            )
+
+    @staticmethod
+    def _weighted_row_mean(rows: list[dict[str, Any]], field_name: str) -> float:
+        total_tokens = sum(int(row["finite_log_ratio_token_count"]) for row in rows)
+        if total_tokens == 0:
+            return 0.0
+        return (
+            sum(
+                float(row[field_name]) * int(row["finite_log_ratio_token_count"])
+                for row in rows
+            )
+            / total_tokens
+        )
+
+    def _summarize_bucket(
+        self,
+        *,
+        label: str,
+        rows: list[dict[str, Any]],
+        token_log_ratios: torch.Tensor,
+    ) -> dict[str, float]:
+        prefix = f"importance_sampling/{label}"
+        sequence_means = torch.tensor(
+            [float(row["raw_sequence_mean_log_ratio"]) for row in rows]
+        )
+        sequence_sums = torch.tensor(
+            [float(row["raw_sequence_sum_log_ratio"]) for row in rows]
+        )
+        response_tokens = torch.tensor(
+            [float(row["response_token_count"]) for row in rows]
+        )
+        rewards = torch.tensor([float(row["reward"]) for row in rows])
+        token_quantiles = self._quantiles(token_log_ratios, (0.05, 0.50, 0.95, 0.99))
+        sequence_quantiles = self._quantiles(sequence_means, (0.50, 0.95))
+        sequence_sum_quantiles = self._quantiles(sequence_sums, (0.50, 0.95))
+        return {
+            f"{prefix}/num_sequences": float(len(rows)),
+            f"{prefix}/num_tokens": float(token_log_ratios.numel()),
+            f"{prefix}/num_nonfinite_tokens": float(
+                sum(int(row["nonfinite_log_ratio_token_count"]) for row in rows)
+            ),
+            f"{prefix}/raw_token_log_ratio_mean": (
+                float(token_log_ratios.mean()) if token_log_ratios.numel() else 0.0
+            ),
+            f"{prefix}/raw_token_abs_log_ratio_mean": (
+                float(token_log_ratios.abs().mean())
+                if token_log_ratios.numel()
+                else 0.0
+            ),
+            f"{prefix}/raw_token_log_ratio_p05": token_quantiles[0],
+            f"{prefix}/raw_token_log_ratio_p50": token_quantiles[1],
+            f"{prefix}/raw_token_log_ratio_p95": token_quantiles[2],
+            f"{prefix}/raw_token_log_ratio_p99": token_quantiles[3],
+            f"{prefix}/raw_sequence_mean_log_ratio_p50": sequence_quantiles[0],
+            f"{prefix}/raw_sequence_mean_log_ratio_p95": sequence_quantiles[1],
+            f"{prefix}/raw_sequence_sum_log_ratio_p50": sequence_sum_quantiles[0],
+            f"{prefix}/raw_sequence_sum_log_ratio_p95": sequence_sum_quantiles[1],
+            f"{prefix}/post_tis_ratio_mean": self._weighted_row_mean(
+                rows, "post_tis_ratio_mean"
+            ),
+            f"{prefix}/tis_oob_fraction": self._weighted_row_mean(
+                rows, "tis_oob_fraction"
+            ),
+            f"{prefix}/nonzero_advantage_fraction": self._weighted_row_mean(
+                rows, "nonzero_advantage_fraction"
+            ),
+            f"{prefix}/objective_signal_proxy_mean": self._weighted_row_mean(
+                rows, "objective_signal_proxy_mean"
+            ),
+            f"{prefix}/reward_mean": float(rewards.mean()) if rewards.numel() else 0.0,
+            f"{prefix}/response_tokens_mean": (
+                float(response_tokens.mean()) if response_tokens.numel() else 0.0
+            ),
+        }
+
+    def flush(self) -> tuple[dict[str, float], list[dict[str, Any]]]:
+        """Return step metrics and rows, then reset the accumulator."""
+        if not self._rows:
+            return {}, []
+
+        metrics: dict[str, float] = {}
+        all_tokens = [
+            values
+            for lag_values in self._token_log_ratios_by_lag.values()
+            for values in lag_values
+        ]
+        metrics.update(
+            self._summarize_bucket(
+                label="all",
+                rows=self._rows,
+                token_log_ratios=(
+                    torch.cat(all_tokens) if all_tokens else torch.empty(0)
+                ),
+            )
+        )
+        for lag in sorted({int(row["observed_lag"]) for row in self._rows}):
+            lag_rows = [row for row in self._rows if row["observed_lag"] == lag]
+            lag_tokens = self._token_log_ratios_by_lag.get(lag, [])
+            metrics.update(
+                self._summarize_bucket(
+                    label=f"lag_{lag}",
+                    rows=lag_rows,
+                    token_log_ratios=(
+                        torch.cat(lag_tokens) if lag_tokens else torch.empty(0)
+                    ),
+                )
+            )
+
+        rows = self._rows
+        self._rows = []
+        self._token_log_ratios_by_lag = {}
+        return metrics, rows
 
 
 def aggregate_step_metrics(train_result: dict[str, Any]) -> dict[str, Any]:
