@@ -188,6 +188,10 @@ class TestImportanceSamplingDiagnosticsAccumulator:
             advantages=torch.tensor([[0.0, 1.0, 1.0, 1.0], [0.0, 0.5, 0.5, 0.5]]),
             rewards=torch.tensor([0.25, 1.0]),
         )
+        assert not any(
+            isinstance(value, torch.Tensor) for value in accumulator.__dict__.values()
+        )
+        assert not hasattr(accumulator, "_token_log_ratios_by_lag")
 
         metrics, rows = accumulator.flush()
 
@@ -195,28 +199,44 @@ class TestImportanceSamplingDiagnosticsAccumulator:
         assert metrics["importance_sampling/all/num_tokens"] == 6
         assert metrics["importance_sampling/lag_0/num_sequences"] == 1
         assert metrics["importance_sampling/lag_2/num_sequences"] == 1
-        assert metrics["importance_sampling/lag_0/raw_token_log_ratio_p50"] == (
+        assert metrics["importance_sampling/all/raw_token_log_ratio_mean"] == (
+            pytest.approx(log_2)
+        )
+        assert metrics[
+            "importance_sampling/all/raw_token_abs_log_ratio_mean"
+        ] == pytest.approx(4 * log_2 / 3)
+        assert metrics["importance_sampling/lag_0/raw_token_log_ratio_mean"] == (
             pytest.approx(0.0)
         )
         assert metrics[
             "importance_sampling/lag_0/raw_token_abs_log_ratio_mean"
         ] == pytest.approx(2 * log_2 / 3)
-        assert metrics["importance_sampling/lag_2/post_tis_ratio_mean"] == (
-            pytest.approx(2.0)
-        )
         assert metrics["importance_sampling/lag_2/tis_oob_fraction"] == (
             pytest.approx(1.0)
         )
         assert metrics[
             "importance_sampling/lag_2/objective_signal_proxy_mean"
         ] == pytest.approx(1.0)
-        assert rows[0]["prompt_group_id"] == "prompt-a"
         assert rows[0]["observed_lag"] == 0
         assert rows[1]["observed_lag"] == 2
         assert rows[0]["reward"] == pytest.approx(0.25)
-        assert rows[0]["raw_sequence_sum_log_ratio"] == pytest.approx(0.0)
-        assert rows[1]["finite_log_ratio_token_count"] == 3
+        assert rows[0]["raw_sequence_mean_log_ratio"] == pytest.approx(0.0)
         assert rows[1]["nonfinite_log_ratio_token_count"] == 0
+        assert set(rows[0]) == {
+            "step",
+            "sample_id",
+            "observed_lag",
+            "total_sequence_length",
+            "response_token_count",
+            "nonfinite_log_ratio_token_count",
+            "reward",
+            "raw_sequence_mean_log_ratio",
+            "raw_token_abs_log_ratio_mean",
+            "tis_oob_fraction",
+            "nonzero_advantage_fraction",
+            "objective_signal_proxy_mean",
+        }
+        assert not any("log_ratio_p" in key for key in metrics)
         assert accumulator.flush() == ({}, [])
 
     def test_signal_proxy_uses_unit_weights_when_correction_is_disabled(self) -> None:
@@ -243,9 +263,7 @@ class TestImportanceSamplingDiagnosticsAccumulator:
 
         metrics, _ = accumulator.flush()
 
-        assert metrics["importance_sampling/lag_1/post_tis_ratio_mean"] == (
-            pytest.approx(2.0)
-        )
+        assert metrics["importance_sampling/lag_1/tis_oob_fraction"] == 1.0
         assert metrics[
             "importance_sampling/lag_1/objective_signal_proxy_mean"
         ] == pytest.approx(2.0)

@@ -46,6 +46,40 @@ _MB_METRIC_MEAN: frozenset[str] = frozenset(
 
 
 @dataclass
+class _ImportanceSamplingBucket:
+    """Exact sufficient statistics for one observed-lag bucket."""
+
+    num_sequences: int = 0
+    num_tokens: int = 0
+    num_nonfinite_tokens: int = 0
+    log_ratio_sum: float = 0.0
+    abs_log_ratio_sum: float = 0.0
+    tis_oob_count: int = 0
+    objective_signal_sum: float = 0.0
+
+    def update(
+        self,
+        *,
+        finite_token_count: int,
+        nonfinite_token_count: int,
+        log_ratio_sum: float,
+        abs_log_ratio_sum: float,
+        tis_oob_count: int,
+        objective_signal_sum: float,
+    ) -> None:
+        self.num_sequences += 1
+        self.num_tokens += finite_token_count
+        self.num_nonfinite_tokens += nonfinite_token_count
+        self.log_ratio_sum += log_ratio_sum
+        self.abs_log_ratio_sum += abs_log_ratio_sum
+        self.tis_oob_count += tis_oob_count
+        self.objective_signal_sum += objective_signal_sum
+
+    def mean(self, total: float) -> float:
+        return total / self.num_tokens if self.num_tokens else 0.0
+
+
+@dataclass
 class ImportanceSamplingDiagnosticsAccumulator:
     """Accumulate raw actor/behavior log-ratio diagnostics for one train step."""
 
@@ -55,16 +89,12 @@ class ImportanceSamplingDiagnosticsAccumulator:
     truncated_importance_sampling_ratio_min: float | None
     truncated_importance_sampling_type: str | None
     _rows: list[dict[str, Any]] = field(default_factory=list, init=False)
-    _token_log_ratios_by_lag: dict[int, list[torch.Tensor]] = field(
+    _all_bucket: _ImportanceSamplingBucket = field(
+        default_factory=_ImportanceSamplingBucket, init=False
+    )
+    _buckets_by_lag: dict[int, _ImportanceSamplingBucket] = field(
         default_factory=dict, init=False
     )
-
-    @staticmethod
-    def _quantiles(values: torch.Tensor, qs: tuple[float, ...]) -> list[float]:
-        if values.numel() == 0:
-            return [0.0] * len(qs)
-        quantiles = torch.quantile(values.float(), torch.tensor(qs))
-        return [float(value) for value in quantiles]
 
     def _post_tis_weights(
         self, log_ratios: torch.Tensor
@@ -168,6 +198,7 @@ class ImportanceSamplingDiagnosticsAccumulator:
             finite_token_count = int(token_log_ratios.numel())
             rollout_version = int(rollout_weight_versions[i])
             lag = int(trainer_version - rollout_version)
+            nonfinite_token_count = response_token_count - finite_token_count
 
             if finite_token_count > 0:
                 post_tis_weights, oob_mask = self._post_tis_weights(token_log_ratios)
@@ -176,39 +207,46 @@ class ImportanceSamplingDiagnosticsAccumulator:
                     if self.use_importance_sampling_correction
                     else torch.ones_like(post_tis_weights)
                 )
-                signal_proxy = (token_advantages.abs() * objective_weights).mean()
-                self._token_log_ratios_by_lag.setdefault(lag, []).append(
-                    token_log_ratios
-                )
-                sequence_sum_log_ratio = float(token_log_ratios.sum())
-                sequence_mean_log_ratio = float(token_log_ratios.mean())
-                token_abs_log_ratio_mean = float(token_log_ratios.abs().mean())
-                post_tis_ratio_mean = float(post_tis_weights.mean())
-                tis_oob_fraction = float(oob_mask.float().mean())
+                objective_signal = token_advantages.abs() * objective_weights
+                log_ratio_sum = float(token_log_ratios.sum())
+                abs_log_ratio_sum = float(token_log_ratios.abs().sum())
+                tis_oob_count = int(oob_mask.sum())
+                objective_signal_sum = float(objective_signal.sum())
+                sequence_mean_log_ratio = log_ratio_sum / finite_token_count
+                token_abs_log_ratio_mean = abs_log_ratio_sum / finite_token_count
+                tis_oob_fraction = tis_oob_count / finite_token_count
                 nonzero_advantage_fraction = float(
                     token_advantages.ne(0).float().mean()
                 )
-                objective_signal_proxy_mean = float(signal_proxy)
-                token_quantiles = self._quantiles(
-                    token_log_ratios, (0.05, 0.50, 0.95, 0.99)
-                )
+                objective_signal_proxy_mean = objective_signal_sum / finite_token_count
             else:
-                sequence_sum_log_ratio = 0.0
+                log_ratio_sum = 0.0
+                abs_log_ratio_sum = 0.0
+                tis_oob_count = 0
+                objective_signal_sum = 0.0
                 sequence_mean_log_ratio = 0.0
                 token_abs_log_ratio_mean = 0.0
-                post_tis_ratio_mean = 0.0
                 tis_oob_fraction = 0.0
                 nonzero_advantage_fraction = 0.0
                 objective_signal_proxy_mean = 0.0
-                token_quantiles = [0.0, 0.0, 0.0, 0.0]
+
+            for bucket in (
+                self._all_bucket,
+                self._buckets_by_lag.setdefault(lag, _ImportanceSamplingBucket()),
+            ):
+                bucket.update(
+                    finite_token_count=finite_token_count,
+                    nonfinite_token_count=nonfinite_token_count,
+                    log_ratio_sum=log_ratio_sum,
+                    abs_log_ratio_sum=abs_log_ratio_sum,
+                    tis_oob_count=tis_oob_count,
+                    objective_signal_sum=objective_signal_sum,
+                )
 
             self._rows.append(
                 {
                     "step": int(step),
                     "sample_id": sample_id,
-                    "prompt_group_id": sample_id.rsplit("_g", 1)[0],
-                    "rollout_weight_version": rollout_version,
-                    "trainer_weight_version": int(trainer_version),
                     "observed_lag": lag,
                     "total_sequence_length": (
                         int(sequence_lengths[i])
@@ -216,19 +254,10 @@ class ImportanceSamplingDiagnosticsAccumulator:
                         else None
                     ),
                     "response_token_count": response_token_count,
-                    "finite_log_ratio_token_count": finite_token_count,
-                    "nonfinite_log_ratio_token_count": (
-                        response_token_count - finite_token_count
-                    ),
+                    "nonfinite_log_ratio_token_count": nonfinite_token_count,
                     "reward": float(rewards.flatten()[i]),
-                    "raw_sequence_sum_log_ratio": sequence_sum_log_ratio,
                     "raw_sequence_mean_log_ratio": sequence_mean_log_ratio,
                     "raw_token_abs_log_ratio_mean": token_abs_log_ratio_mean,
-                    "raw_token_log_ratio_p05": token_quantiles[0],
-                    "raw_token_log_ratio_p50": token_quantiles[1],
-                    "raw_token_log_ratio_p95": token_quantiles[2],
-                    "raw_token_log_ratio_p99": token_quantiles[3],
-                    "post_tis_ratio_mean": post_tis_ratio_mean,
                     "tis_oob_fraction": tis_oob_fraction,
                     "nonzero_advantage_fraction": nonzero_advantage_fraction,
                     "objective_signal_proxy_mean": objective_signal_proxy_mean,
@@ -236,76 +265,21 @@ class ImportanceSamplingDiagnosticsAccumulator:
             )
 
     @staticmethod
-    def _weighted_row_mean(rows: list[dict[str, Any]], field_name: str) -> float:
-        total_tokens = sum(int(row["finite_log_ratio_token_count"]) for row in rows)
-        if total_tokens == 0:
-            return 0.0
-        return (
-            sum(
-                float(row[field_name]) * int(row["finite_log_ratio_token_count"])
-                for row in rows
-            )
-            / total_tokens
-        )
-
     def _summarize_bucket(
-        self,
-        *,
-        label: str,
-        rows: list[dict[str, Any]],
-        token_log_ratios: torch.Tensor,
+        *, label: str, bucket: _ImportanceSamplingBucket
     ) -> dict[str, float]:
         prefix = f"importance_sampling/{label}"
-        sequence_means = torch.tensor(
-            [float(row["raw_sequence_mean_log_ratio"]) for row in rows]
-        )
-        sequence_sums = torch.tensor(
-            [float(row["raw_sequence_sum_log_ratio"]) for row in rows]
-        )
-        response_tokens = torch.tensor(
-            [float(row["response_token_count"]) for row in rows]
-        )
-        rewards = torch.tensor([float(row["reward"]) for row in rows])
-        token_quantiles = self._quantiles(token_log_ratios, (0.05, 0.50, 0.95, 0.99))
-        sequence_quantiles = self._quantiles(sequence_means, (0.50, 0.95))
-        sequence_sum_quantiles = self._quantiles(sequence_sums, (0.50, 0.95))
         return {
-            f"{prefix}/num_sequences": float(len(rows)),
-            f"{prefix}/num_tokens": float(token_log_ratios.numel()),
-            f"{prefix}/num_nonfinite_tokens": float(
-                sum(int(row["nonfinite_log_ratio_token_count"]) for row in rows)
+            f"{prefix}/num_sequences": float(bucket.num_sequences),
+            f"{prefix}/num_tokens": float(bucket.num_tokens),
+            f"{prefix}/num_nonfinite_tokens": float(bucket.num_nonfinite_tokens),
+            f"{prefix}/raw_token_log_ratio_mean": bucket.mean(bucket.log_ratio_sum),
+            f"{prefix}/raw_token_abs_log_ratio_mean": bucket.mean(
+                bucket.abs_log_ratio_sum
             ),
-            f"{prefix}/raw_token_log_ratio_mean": (
-                float(token_log_ratios.mean()) if token_log_ratios.numel() else 0.0
-            ),
-            f"{prefix}/raw_token_abs_log_ratio_mean": (
-                float(token_log_ratios.abs().mean())
-                if token_log_ratios.numel()
-                else 0.0
-            ),
-            f"{prefix}/raw_token_log_ratio_p05": token_quantiles[0],
-            f"{prefix}/raw_token_log_ratio_p50": token_quantiles[1],
-            f"{prefix}/raw_token_log_ratio_p95": token_quantiles[2],
-            f"{prefix}/raw_token_log_ratio_p99": token_quantiles[3],
-            f"{prefix}/raw_sequence_mean_log_ratio_p50": sequence_quantiles[0],
-            f"{prefix}/raw_sequence_mean_log_ratio_p95": sequence_quantiles[1],
-            f"{prefix}/raw_sequence_sum_log_ratio_p50": sequence_sum_quantiles[0],
-            f"{prefix}/raw_sequence_sum_log_ratio_p95": sequence_sum_quantiles[1],
-            f"{prefix}/post_tis_ratio_mean": self._weighted_row_mean(
-                rows, "post_tis_ratio_mean"
-            ),
-            f"{prefix}/tis_oob_fraction": self._weighted_row_mean(
-                rows, "tis_oob_fraction"
-            ),
-            f"{prefix}/nonzero_advantage_fraction": self._weighted_row_mean(
-                rows, "nonzero_advantage_fraction"
-            ),
-            f"{prefix}/objective_signal_proxy_mean": self._weighted_row_mean(
-                rows, "objective_signal_proxy_mean"
-            ),
-            f"{prefix}/reward_mean": float(rewards.mean()) if rewards.numel() else 0.0,
-            f"{prefix}/response_tokens_mean": (
-                float(response_tokens.mean()) if response_tokens.numel() else 0.0
+            f"{prefix}/tis_oob_fraction": bucket.mean(float(bucket.tis_oob_count)),
+            f"{prefix}/objective_signal_proxy_mean": bucket.mean(
+                bucket.objective_signal_sum
             ),
         }
 
@@ -314,37 +288,22 @@ class ImportanceSamplingDiagnosticsAccumulator:
         if not self._rows:
             return {}, []
 
-        metrics: dict[str, float] = {}
-        all_tokens = [
-            values
-            for lag_values in self._token_log_ratios_by_lag.values()
-            for values in lag_values
-        ]
-        metrics.update(
-            self._summarize_bucket(
-                label="all",
-                rows=self._rows,
-                token_log_ratios=(
-                    torch.cat(all_tokens) if all_tokens else torch.empty(0)
-                ),
-            )
+        metrics = self._summarize_bucket(
+            label="all",
+            bucket=self._all_bucket,
         )
-        for lag in sorted({int(row["observed_lag"]) for row in self._rows}):
-            lag_rows = [row for row in self._rows if row["observed_lag"] == lag]
-            lag_tokens = self._token_log_ratios_by_lag.get(lag, [])
+        for lag, bucket in sorted(self._buckets_by_lag.items()):
             metrics.update(
                 self._summarize_bucket(
                     label=f"lag_{lag}",
-                    rows=lag_rows,
-                    token_log_ratios=(
-                        torch.cat(lag_tokens) if lag_tokens else torch.empty(0)
-                    ),
+                    bucket=bucket,
                 )
             )
 
         rows = self._rows
         self._rows = []
-        self._token_log_ratios_by_lag = {}
+        self._all_bucket = _ImportanceSamplingBucket()
+        self._buckets_by_lag = {}
         return metrics, rows
 
 

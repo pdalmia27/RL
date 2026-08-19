@@ -194,7 +194,7 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     max_buffered_rollouts: int = 64
     # Enable per-rollout diagnostic prints (prompt content / completion previews).
     diagnostics: bool = False
-    # Log lag-bucketed token/sequence importance-sampling diagnostics and JSONL rows.
+    # Log exact online importance-sampling summaries by lag and compact JSONL rows.
     # May require a policy-logprob pass that would otherwise be skipped.
     importance_sampling_diagnostics: bool = False
 
